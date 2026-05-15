@@ -2,6 +2,7 @@ import { Badge } from "@/components/ui/badge";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { useProxyHealth, useAllIndices, useFnOStocks, useLiveOptionChain } from "@/hooks/useMarketData";
 import { useWebSocketStatus, useWebSocketVix } from "@/hooks/useWebSocket";
+import { useUpstoxFeedStatus } from "@/hooks/useUpstoxIndexTicks";
 import { Globe, BarChart3, Activity, Server, Zap, Radio, Database, TrendingUp } from "lucide-react";
 
 interface SourceStatus {
@@ -18,49 +19,49 @@ export function DataSourcesBar() {
   const { data: fnoData } = useFnOStocks();
   const { data: niftyOC } = useLiveOptionChain("NIFTY");
   const wsConnected = useWebSocketStatus();
+  const upstoxFeedConnected = useUpstoxFeedStatus();
   const { vix: wsVix } = useWebSocketVix();
 
-  const dhanConfigured = health?.sources?.dhan === true;
+  const upstoxConfigured = health?.sources?.upstox === true;
   const dhanWSConnected = health?.websocket?.dhanConnected === true;
   const fnoSource = (fnoData as any)?.source || "none";
   const ocSource = niftyOC?.source || "offline";
 
   const sources: SourceStatus[] = [
-    // ── DHAN (Primary — always first) ──
+    // ── Trishakti primary: Upstox + Nubra ──
     {
-      name: "Dhan API",
+      name: "Upstox API",
       icon: <TrendingUp className="h-3 w-3" />,
-      status: dhanConfigured
-        ? (ocSource === "dhan" ? "live" : dhanWSConnected ? "degraded" : "offline")
-        : "offline",
-      detail: !dhanConfigured
-        ? "No credentials in .env"
-        : ocSource === "dhan"
+      status: ocSource === "upstox" ? "live" : upstoxConfigured ? "degraded" : "offline",
+      detail: ocSource === "upstox"
         ? "Primary · Option Chain"
-        : dhanWSConnected
-        ? "WebSocket only"
-        : "Configured but no response",
+        : upstoxConfigured
+        ? "Configured · waiting for option-chain response"
+        : "Add Upstox token in Broker Settings or .env",
       primary: true,
     },
-    // ── Dhan WebSocket ──
     {
-      name: "Dhan WS",
+      name: "Nubra OI",
+      icon: <Database className="h-3 w-3" />,
+      status: health?.sources?.nubra ? "live" : "offline",
+      detail: health?.sources?.nubra ? "OI/refdata credentials loaded" : "Requires Nubra session token",
+    },
+    {
+      name: "Legacy Dhan WS",
       icon: <Zap className="h-3 w-3" />,
-      status: dhanWSConnected ? "live" : dhanConfigured ? "offline" : "offline",
+      status: dhanWSConnected ? "live" : "offline",
       detail: dhanWSConnected
         ? `Live ticks · ${health?.websocket?.cachedTicks || 0} cached · ${health?.websocket?.instrumentsSubscribed || 0} instruments`
-        : dhanConfigured
-        ? "Disconnected"
-        : "Requires Dhan credentials",
+        : "Standby fallback",
     },
     // ── Browser WebSocket (relay) ──
     {
-      name: "Live Feed",
+      name: "Upstox Feed",
       icon: <Radio className="h-3 w-3" />,
-      status: wsConnected ? "live" : "offline",
-      detail: wsConnected
+      status: upstoxFeedConnected ? "live" : wsConnected ? "degraded" : "offline",
+      detail: upstoxFeedConnected
         ? `Browser connected · ${health?.websocket?.browserClients || 0} clients`
-        : "Browser WS disconnected",
+        : wsConnected ? `Legacy relay connected · ${health?.websocket?.browserClients || 0} clients` : "Upstox websocket disconnected",
     },
     // ── NSE India ──
     {
@@ -74,7 +75,7 @@ export function DataSourcesBar() {
       detail: allIndices?.isLive
         ? `Indices${ocSource === "nse" ? " + Option Chain (fallback)" : " + Sectors"}`
         : ocSource === "nse"
-        ? "Option Chain (Dhan unavailable)"
+        ? "Option Chain fallback"
         : "No data",
     },
     // ── TradingView Scanner ──
@@ -98,7 +99,7 @@ export function DataSourcesBar() {
       icon: <Activity className="h-3 w-3" />,
       status: wsVix ? "live" : allIndices?.vix ? "degraded" : "offline",
       detail: wsVix
-        ? `Dhan WS: ${wsVix.value?.toFixed(2)}`
+        ? `Live feed: ${wsVix.value?.toFixed(2)}`
         : allIndices?.vix
         ? `NSE Poll: ${allIndices.vix.value?.toFixed(2)}`
         : "No data",

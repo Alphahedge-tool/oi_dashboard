@@ -115,7 +115,7 @@ export default function Index() {
           icon={<TrendingUp className="h-4 w-4" />}
           tooltip="Real-time spot prices for major indices. The mini-chart shows today's intraday movement. Click to open option chain."
         />
-        <IndexCards indices={indices} />
+        <IndexCards indices={indices} isLive={isLive} />
 
         {/* ═══ KEY METRICS ═══ */}
         <SectionHeader

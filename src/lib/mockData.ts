@@ -21,6 +21,7 @@ export interface OptionData {
 export interface OptionLegData {
   ltp: number;
   oi: number;
+  previousOi?: number;
   oiChange: number;
   volume: number;
   iv: number;

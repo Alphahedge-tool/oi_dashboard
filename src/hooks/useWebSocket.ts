@@ -7,6 +7,7 @@
 
 import { useState, useEffect, useCallback, useMemo } from "react";
 import { marketWS, SYMBOL_TO_SECURITY_ID, type TickData } from "@/lib/websocketClient";
+import { useUpstoxVix } from "@/hooks/useUpstoxIndexTicks";
 
 // ── Hook: WebSocket Connection Status ──
 
@@ -119,10 +120,12 @@ export interface WebSocketVixData {
 }
 
 export function useWebSocketVix(): { vix: WebSocketVixData | null; isConnected: boolean } {
+  const { vix: upstoxVix, isConnected: upstoxConnected } = useUpstoxVix();
   const isConnected = useWebSocketStatus();
   const tick = useWebSocketTick("INDIAVIX");
 
   const vix = useMemo(() => {
+    if (upstoxVix) return upstoxVix;
     if (!tick?.ltp) return null;
     return {
       value: tick.ltp,
@@ -131,9 +134,9 @@ export function useWebSocketVix(): { vix: WebSocketVixData | null; isConnected: 
       high: tick.high || tick.ltp,
       low: tick.low || tick.ltp,
     };
-  }, [tick]);
+  }, [tick, upstoxVix]);
 
-  return { vix, isConnected };
+  return { vix, isConnected: upstoxConnected || isConnected };
 }
 
 // ── Hook: Force reconnect ──

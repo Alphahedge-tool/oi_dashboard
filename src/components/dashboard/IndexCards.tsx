@@ -3,7 +3,6 @@ import { useNavigate } from "react-router-dom";
 import { Card, CardContent } from "@/components/ui/card";
 import { TrendingUp, TrendingDown, Radio, Moon } from "lucide-react";
 import { AreaChart, Area, ResponsiveContainer } from "recharts";
-import { useWebSocketStatus } from "@/hooks/useWebSocket";
 import { getCandleHistory, type CandleHistory } from "@/lib/localDatabase";
 import { useChartData } from "@/hooks/useChartData";
 
@@ -21,6 +20,7 @@ interface IndexData {
 
 interface Props {
   indices: IndexData[];
+  isLive?: boolean;
 }
 
 // Map index symbols to their Dhan security IDs
@@ -31,14 +31,13 @@ const SYMBOL_SEC_MAP: Record<string, string> = {
   MIDCPNIFTY: "442",
 };
 
-export function IndexCards({ indices }: Props) {
+export function IndexCards({ indices, isLive }: Props) {
   const navigate = useNavigate();
-  const wsConnected = useWebSocketStatus();
 
   return (
     <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-3">
       {indices.map((index, idx) => (
-        <IndexCard key={index.symbol} index={index} idx={idx} isLive={wsConnected} onClick={() => navigate(`/option-chain?symbol=${index.symbol}`)} />
+        <IndexCard key={index.symbol} index={index} idx={idx} isLive={isLive} onClick={() => navigate(`/option-chain?symbol=${index.symbol}`)} />
       ))}
     </div>
   );

@@ -18,6 +18,7 @@ import { URL } from "node:url";
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, existsSync } from "node:fs";
 import { resolve, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { gunzipSync } from "node:zlib";
 import { WebSocketServer, WebSocket } from "ws";
 
 // ── Load .env manually (no external deps needed) ──
@@ -41,6 +42,10 @@ try {
 const PORT = parseInt(process.env.PROXY_PORT || "4002", 10);
 const DHAN_BASE = "https://api.dhan.co/v2";
 const NSE_BASE = "https://www.nseindia.com";
+const UPSTOX_INSTRUMENTS_URL = "https://assets.upstox.com/market-quote/instruments/exchange/complete.json.gz";
+const NUBRA_API = "https://api.nubra.io";
+let upstoxGzipCache = null;
+let upstoxJsonCache = null;
 
 // ══════════════════════════════════════════════
 // ── SECTION 1: In-Memory Cache ──
@@ -80,6 +85,200 @@ function getLastGoodFromDisk(key) {
     }
   } catch { /* ignore corrupt files */ }
   return null;
+}
+
+async function readJsonBody(req) {
+  const chunks = [];
+  for await (const chunk of req) chunks.push(chunk);
+  const raw = Buffer.concat(chunks).toString("utf8");
+  return raw ? JSON.parse(raw) : {};
+}
+
+async function getUpstoxInstrumentGzip() {
+  if (upstoxGzipCache) return upstoxGzipCache;
+  const response = await fetch(UPSTOX_INSTRUMENTS_URL);
+  if (!response.ok) throw new Error(`Upstox instruments HTTP ${response.status}`);
+  upstoxGzipCache = Buffer.from(await response.arrayBuffer());
+  return upstoxGzipCache;
+}
+
+async function getUpstoxInstrumentsJson() {
+  if (upstoxJsonCache) return upstoxJsonCache;
+  const gz = await getUpstoxInstrumentGzip();
+  upstoxJsonCache = JSON.parse(gunzipSync(gz).toString("utf8"));
+  return upstoxJsonCache;
+}
+
+const UPSTOX_INDEX_KEYS = {
+  NIFTY: "NSE_INDEX|Nifty 50",
+  BANKNIFTY: "NSE_INDEX|Nifty Bank",
+  FINNIFTY: "NSE_INDEX|Nifty Fin Service",
+  MIDCPNIFTY: "NSE_INDEX|Nifty Midcap Select",
+  SENSEX: "BSE_INDEX|SENSEX",
+  BANKEX: "BSE_INDEX|BANKEX",
+};
+
+function normalizeLookup(value) {
+  return String(value || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+function upstoxExpiryMs(item) {
+  const raw = item?.expiry ?? item?.expiry_date ?? item?.expiryDate;
+  if (raw == null || raw === "") return Number.POSITIVE_INFINITY;
+  if (typeof raw === "number") return raw > 10_000_000_000 ? raw : raw * 1000;
+  const text = String(raw);
+  if (/^\d{8}$/.test(text)) return Date.parse(`${text.slice(0, 4)}-${text.slice(4, 6)}-${text.slice(6, 8)}T00:00:00+05:30`);
+  const numeric = Number(text);
+  if (Number.isFinite(numeric)) return numeric > 10_000_000_000 ? numeric : numeric * 1000;
+  const parsed = Date.parse(text);
+  return Number.isFinite(parsed) ? parsed : Number.POSITIVE_INFINITY;
+}
+
+function formatUpstoxExpiry(raw) {
+  const date = new Date(upstoxExpiryMs({ expiry: raw }));
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Kolkata",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(date);
+  return `${parts.find((p) => p.type === "year")?.value || "1970"}-${parts.find((p) => p.type === "month")?.value || "01"}-${parts.find((p) => p.type === "day")?.value || "01"}`;
+}
+
+async function resolveUpstoxUnderlying(symbol) {
+  const upper = String(symbol || "NIFTY").toUpperCase();
+  const instruments = await getUpstoxInstrumentsJson();
+  const directKey = UPSTOX_INDEX_KEYS[upper];
+  if (directKey) return { symbol: upper, instrumentKey: directKey };
+
+  const normalized = normalizeLookup(upper);
+  const hit = instruments.find((item) => {
+    const type = String(item.instrument_type || item.instrumentType || "").toUpperCase();
+    if (!["EQ", "EQUITY", "INDEX"].includes(type)) return false;
+    return normalizeLookup(item.trading_symbol || item.tradingsymbol || item.symbol || item.name) === normalized;
+  });
+  return { symbol: upper, instrumentKey: hit?.instrument_key || hit?.instrumentKey || "" };
+}
+
+async function handleUpstoxInstruments(_params, res) {
+  const gz = await getUpstoxInstrumentGzip();
+  res.setHeader("Content-Type", "application/gzip");
+  res.setHeader("Content-Length", gz.length);
+  res.writeHead(200);
+  res.end(gz);
+}
+
+async function handleUpstoxExpiries(params) {
+  const symbol = String(params.get("symbol") || "NIFTY").toUpperCase();
+  const instruments = await getUpstoxInstrumentsJson();
+  const normalized = normalizeLookup(symbol);
+  const expiries = new Map();
+
+  for (const item of instruments) {
+    const type = String(item.instrument_type || item.instrumentType || item.option_type || item.optionType || "").toUpperCase();
+    if (type !== "CE" && type !== "PE") continue;
+    const underlying = item.underlying_symbol || item.asset || item.name;
+    if (normalizeLookup(underlying) !== normalized) continue;
+    const raw = item.expiry ?? item.expiry_date ?? item.expiryDate;
+    if (raw != null) expiries.set(String(raw), raw);
+  }
+
+  return [...expiries.values()]
+    .sort((a, b) => upstoxExpiryMs({ expiry: a }) - upstoxExpiryMs({ expiry: b }))
+    .map((raw) => formatUpstoxExpiry(raw));
+}
+
+async function handleUpstoxOptionChain(params, accessToken) {
+  const symbol = params.get("symbol");
+  const explicitKey = params.get("instrument_key");
+  const expiry = params.get("expiry") || params.get("expiry_date");
+  const token = accessToken || params.get("token") || process.env.UPSTOX_ACCESS_TOKEN || "";
+
+  if (!token) throw new Error("No Upstox access token available");
+  const instrumentKey = explicitKey || (await resolveUpstoxUnderlying(symbol)).instrumentKey;
+  if (!instrumentKey || !expiry) throw new Error("instrument_key/symbol and expiry are required");
+
+  const upstream = new URL("https://api.upstox.com/v2/option/chain");
+  upstream.searchParams.set("instrument_key", instrumentKey);
+  upstream.searchParams.set("expiry_date", formatUpstoxExpiry(expiry));
+
+  const response = await fetch(upstream, {
+    headers: { accept: "application/json", authorization: `Bearer ${token}` },
+  });
+  const json = await response.json().catch(async () => ({ error: await response.text() }));
+  if (!response.ok) throw new Error(json?.message || json?.error || `Upstox option chain HTTP ${response.status}`);
+  return json;
+}
+
+async function handleUpstoxFeedAuthorize(accessToken) {
+  const token = accessToken || process.env.UPSTOX_ACCESS_TOKEN || "";
+  if (!token) throw new Error("No Upstox access token available");
+
+  const response = await fetch("https://api.upstox.com/v3/feed/market-data-feed/authorize", {
+    headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+  });
+  const json = await response.json().catch(async () => ({ error: await response.text() }));
+  if (!response.ok) throw new Error(json?.message || json?.error || `Upstox feed authorize HTTP ${response.status}`);
+  return json;
+}
+
+function nubraProxyHeaders(req) {
+  const sessionToken = req.headers["x-session-token"] || "";
+  const authToken = req.headers["x-auth-token"] || "";
+  const deviceId = req.headers["x-device-id"] || "web";
+  const rawCookie =
+    req.headers["x-raw-cookie"] ||
+    `authToken=${authToken || sessionToken}; sessionToken=${sessionToken}; deviceId=${deviceId}`;
+  return {
+    accept: "application/json, text/plain, */*",
+    authorization: `Bearer ${sessionToken}`,
+    cookie: rawCookie,
+    origin: "https://nubra.io",
+    referer: "https://nubra.io/",
+    "x-device-id": deviceId,
+    "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+  };
+}
+
+async function handleNubraInstruments(req) {
+  const url = new URL(req.url, `http://localhost:${PORT}`);
+  const sessionToken = url.searchParams.get("session_token") || req.headers["x-session-token"];
+  const authToken = url.searchParams.get("auth_token") || req.headers["x-auth-token"];
+  const deviceId = url.searchParams.get("device_id") || req.headers["x-device-id"] || "web";
+  if (!sessionToken) throw new Error("session_token is required");
+  const today = new Date().toISOString().slice(0, 10);
+  const headers = {
+    accept: "application/json",
+    authorization: `Bearer ${sessionToken}`,
+    "x-device-id": deviceId,
+    ...(authToken ? { cookie: `authToken=${authToken}; sessionToken=${sessionToken}` } : {}),
+  };
+  const [nseRes, bseRes, indexRes] = await Promise.all([
+    fetch(`${NUBRA_API}/refdata/refdata/${today}?exchange=NSE`, { headers }),
+    fetch(`${NUBRA_API}/refdata/refdata/${today}?exchange=BSE`, { headers }),
+    fetch(`${NUBRA_API}/public/indexes?format=csv`),
+  ]);
+  const [nseJson, bseJson, indexCsv] = await Promise.all([
+    nseRes.json().catch(() => ({})),
+    bseRes.json().catch(() => ({})),
+    indexRes.text().catch(() => ""),
+  ]);
+  const refdata = [...(nseJson.refdata || nseJson.data?.refdata || []), ...(bseJson.refdata || bseJson.data?.refdata || [])];
+  if (!refdata.length) throw new Error("No instruments returned from Nubra API");
+  return { refdata, indexesCsv: indexCsv };
+}
+
+async function handleNubraTimeseries(req) {
+  const body = await readJsonBody(req);
+  if (!Array.isArray(body.query)) throw new Error("query[] is required");
+  const response = await fetch(`${NUBRA_API}/charts/timeseries?chart=${encodeURIComponent(body.chart || "Put_Call_Ratio")}`, {
+    method: "POST",
+    headers: { ...nubraProxyHeaders(req), "content-type": "application/json" },
+    body: JSON.stringify({ chart: body.chart || "Put_Call_Ratio", query: body.query }),
+  });
+  const json = await response.json().catch(async () => ({ error: await response.text() }));
+  if (!response.ok) throw new Error(json?.error || `Nubra timeseries HTTP ${response.status}`);
+  return json;
 }
 
 // Rehydrate lastGoodCache from disk on startup
@@ -1136,7 +1335,7 @@ localWSS.on("connection", (ws) => {
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type, x-dhan-client-id, x-dhan-access-token",
+  "Access-Control-Allow-Headers": "Content-Type, x-dhan-client-id, x-dhan-access-token, x-upstox-access-token, x-session-token, x-auth-token, x-device-id, x-raw-cookie",
 };
 
 const server = http.createServer(async (req, res) => {
@@ -1152,7 +1351,29 @@ const server = http.createServer(async (req, res) => {
   Object.entries(CORS_HEADERS).forEach(([k, v]) => res.setHeader(k, v));
 
   try {
-    if (url.pathname === "/api/dhan-proxy") {
+    if (url.pathname === "/api/upstox-instruments") {
+      await handleUpstoxInstruments(params, res);
+    } else if (url.pathname === "/api/upstox-expiries") {
+      const data = await handleUpstoxExpiries(params);
+      res.writeHead(200);
+      res.end(JSON.stringify({ status: "success", data }));
+    } else if (url.pathname === "/api/upstox-option-chain") {
+      const data = await handleUpstoxOptionChain(params, req.headers["x-upstox-access-token"]);
+      res.writeHead(200);
+      res.end(JSON.stringify(data));
+    } else if (url.pathname === "/api/upstox-feed-authorize") {
+      const data = await handleUpstoxFeedAuthorize(req.headers["x-upstox-access-token"]);
+      res.writeHead(200);
+      res.end(JSON.stringify(data));
+    } else if (url.pathname === "/api/nubra-instruments") {
+      const data = await handleNubraInstruments(req);
+      res.writeHead(200);
+      res.end(JSON.stringify(data));
+    } else if (url.pathname === "/api/nubra-timeseries") {
+      const data = await handleNubraTimeseries(req);
+      res.writeHead(200);
+      res.end(JSON.stringify(data));
+    } else if (url.pathname === "/api/dhan-proxy") {
       const userClientId = req.headers["x-dhan-client-id"];
       const userAccessToken = req.headers["x-dhan-access-token"];
       const { data, cacheHit } = await handleDhanProxy(params, userClientId, userAccessToken);
@@ -1200,6 +1421,8 @@ const server = http.createServer(async (req, res) => {
           cachedTicks: latestTicks.size,
         },
         sources: {
+          upstox: !!process.env.UPSTOX_ACCESS_TOKEN,
+          nubra: !!process.env.NUBRA_SESSION_TOKEN,
           dhan: !!process.env.DHAN_CLIENT_ID,
           tradingview: true,
           nse: true,

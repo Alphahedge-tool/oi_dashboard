@@ -1,4 +1,4 @@
-import { useState, useMemo, useRef, useCallback, useEffect } from "react";
+import { Fragment, useState, useMemo, useRef, useCallback, useEffect } from "react";
 import { useSearchParams, useNavigate } from "react-router-dom";
 import { Card, CardContent } from "@/components/ui/card";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
@@ -15,6 +15,7 @@ import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover
 import { Switch } from "@/components/ui/switch";
 import { Label } from "@/components/ui/label";
 import { useLiveOptionChain } from "@/hooks/useMarketData";
+import { useUpstoxLiveOptionChain } from "@/hooks/useUpstoxLiveOptionChain";
 import { StockChart } from "@/components/StockChart";
 import { toast } from "sonner";
 
@@ -252,6 +253,57 @@ function OIBar({ value, max, side }: { value: number; max: number; side: "call" 
   );
 }
 
+const fmtNum = (value: number, digits = 2) =>
+  Number.isFinite(value)
+    ? value.toLocaleString("en-IN", { minimumFractionDigits: digits, maximumFractionDigits: digits })
+    : "-";
+
+const fmtCompactIN = (value: number) => {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return "-";
+  if (Math.abs(n) >= 1_00_00_000) return `${(n / 1_00_00_000).toFixed(2)} Cr`;
+  if (Math.abs(n) >= 1_00_000) return `${(n / 1_00_000).toFixed(2)} L`;
+  if (Math.abs(n) >= 1_000) return `${(n / 1_000).toFixed(1)}K`;
+  return Math.round(n).toLocaleString("en-IN");
+};
+
+const fmtSigned = (value: number) => {
+  if (!Number.isFinite(value)) return "-";
+  return `${value >= 0 ? "+" : ""}${Math.round(value).toLocaleString("en-IN")}`;
+};
+
+function TerminalOiCell({
+  value,
+  previous,
+  max,
+  align = "right",
+}: {
+  value: number;
+  previous: number;
+  max: number;
+  align?: "left" | "right";
+}) {
+  const todayPct = Math.min((Math.abs(value) / Math.max(max, 1)) * 100, 100);
+  const prevPct = Math.min((Math.abs(previous) / Math.max(max, 1)) * 100, 100);
+  const changePct = previous ? ((value - previous) / Math.abs(previous)) * 100 : 0;
+  return (
+    <div className={`min-w-[96px] ${align === "right" ? "text-right" : "text-left"}`}>
+      <div className="text-[12px] leading-4 text-emerald-700 dark:text-emerald-400">{fmtCompactIN(value)}</div>
+      <div className={`relative mt-0.5 h-[7px] w-full ${align === "right" ? "ml-auto" : "mr-auto"}`}>
+        <div
+          className={`absolute top-0 h-[3px] bg-amber-500 dark:bg-[#f1c46b] ${align === "right" ? "right-0" : "left-0"}`}
+          style={{ width: `${todayPct}%` }}
+        />
+        <div
+          className={`absolute bottom-0 h-[3px] bg-amber-700 dark:bg-[#b78a43] ${align === "right" ? "right-0" : "left-0"}`}
+          style={{ width: `${prevPct}%` }}
+        />
+      </div>
+      <div className="text-[10px] leading-3 text-slate-700 dark:text-slate-100">{changePct >= 0 ? "+" : ""}{changePct.toFixed(2)} %</div>
+    </div>
+  );
+}
+
 export default function OptionChain() {
   const [searchParams] = useSearchParams();
   const navigate = useNavigate();
@@ -276,13 +328,14 @@ export default function OptionChain() {
 
   const { data, isLoading, refetch } = useLiveOptionChain(symbol, selectedExpiry);
 
-  const chain = data?.chain || [];
+  const baseChain = data?.chain || [];
+  const { chain, connected: upstoxTickConnected } = useUpstoxLiveOptionChain(baseChain, data?.source === "upstox");
   const spotPrice = data?.spotPrice || 0;
   const lotSize = data?.lotSize || 25;
   const stepSize = data?.stepSize || 50;
   const maxPain = data?.maxPain || 0;
   const expiries = data?.expiries || [];
-  const isLive = data?.isLive || false;
+  const isLive = data?.isLive || upstoxTickConnected || false;
   const afterHours = data?.afterHours || false;
   const hasData = chain.length > 0;
 
@@ -519,6 +572,178 @@ export default function OptionChain() {
   const callCols = [columnConfig.iv, columnConfig.intrinsic, columnConfig.timeValue, columnConfig.rho, columnConfig.vega, columnConfig.theta, columnConfig.gamma, columnConfig.delta, columnConfig.price, columnConfig.ask, columnConfig.bid, columnConfig.volume].filter(Boolean).length;
   const putCols = callCols;
 
+  const previousOiFor = (leg: { oi: number; oiChange: number; previousOi?: number }) => {
+    const previousOi = Number(leg.previousOi);
+    if (Number.isFinite(previousOi)) return Math.max(previousOi, 0);
+    return Math.max(leg.oi - leg.oiChange, 0);
+  };
+
+  const oiChangeFor = (leg: { oi: number; oiChange: number; previousOi?: number }) =>
+    leg.oi - previousOiFor(leg);
+
+  const terminalMaxOI = Math.max(
+    ...enrichedChain.map((row) =>
+      Math.max(row.ce.oi, row.pe.oi, previousOiFor(row.ce), previousOiFor(row.pe)),
+    ),
+    1,
+  );
+  const spotInsertIndex = enrichedChain.findIndex((row) => row.strikePrice > spotPrice);
+  const visibleExpiry = selectedExpiry || expiries[0]?.value;
+
+  return (
+    <div className="-m-3 h-[calc(100vh-78px)] min-h-[720px] overflow-hidden bg-white text-slate-900 shadow-sm dark:bg-[#19151f] dark:text-white lg:-m-4">
+      <div className="flex h-full min-h-0 flex-col">
+        <div className="flex h-11 items-center justify-between border-b border-slate-200 px-3 dark:border-[#3b3344]">
+          <div className="flex items-center gap-2">
+            <Search className="h-4 w-4 text-slate-900 dark:text-white" />
+            <div className="leading-tight">
+              <div className="text-[11px] text-slate-500 dark:text-[#9b8ab0]">Option Chain for</div>
+              <button
+                className="text-[13px] font-semibold text-slate-900 dark:text-white"
+                onClick={() => setSymbol(symbol === "NIFTY" ? "BANKNIFTY" : "NIFTY")}
+              >
+                {symbol}
+              </button>
+            </div>
+          </div>
+          <div className="flex items-center gap-4 text-[12px]">
+            <button onClick={() => refetch()} className="text-slate-800 hover:text-violet-700 dark:text-white dark:hover:text-violet-300">
+              <RefreshCw className="h-4 w-4" />
+            </button>
+            <span>Max pain: <b>{maxPain.toLocaleString("en-IN", { minimumFractionDigits: 2 })}</b></span>
+            <span>India VIX <span className="text-red-600">▼ 18.48</span></span>
+            <Button variant="outline" className="h-7 rounded px-2 text-xs" onClick={() => navigate("/oi-analysis")}>OI ↗</Button>
+            <Settings2 className="h-4 w-4" />
+          </div>
+        </div>
+
+        <div className="flex h-10 items-center gap-2 overflow-x-auto border-b border-slate-200 px-3 text-[12px] dark:border-[#3b3344]">
+          <button className="mr-2 flex items-center gap-1 font-semibold text-violet-800 dark:text-violet-300">All <ChevronUp className="h-3 w-3" /></button>
+          {expiries.map((exp) => (
+            <button
+              key={exp.value}
+              onClick={() => setSelectedExpiry(exp.value)}
+              className={`h-6 shrink-0 rounded border px-3 ${visibleExpiry === exp.value ? "border-violet-600 bg-violet-50 text-violet-800 dark:border-violet-500 dark:bg-[#231934] dark:text-violet-200" : "border-slate-300 bg-white text-slate-700 hover:bg-slate-50 dark:border-[#5a5065] dark:bg-[#211b28] dark:text-slate-200 dark:hover:bg-[#2c2535]"}`}
+            >
+              {exp.label.replace(/,/g, "")} {exp.daysToExpiry <= 14 && <span className="ml-1 rounded-sm border px-1 text-[10px]">W</span>}
+            </button>
+          ))}
+          <ChevronRight className="ml-auto h-4 w-4 shrink-0 text-slate-700 dark:text-slate-200" />
+        </div>
+
+        <div className="flex h-9 items-center justify-between border-b border-slate-200 px-4 text-[12px] font-semibold text-violet-900 dark:border-[#3b3344] dark:text-violet-300">
+          <div>« Calls</div>
+          <div>Puts »</div>
+        </div>
+
+        <div className="min-h-0 flex-1 overflow-auto bg-white dark:bg-[#19151f]">
+          {isLoading ? (
+            <div className="flex h-full min-h-[520px] items-center justify-center text-sm text-slate-500 dark:text-slate-300">Loading option chain...</div>
+          ) : !enrichedChain.length ? (
+            <div className="flex h-full min-h-[520px] flex-col items-center justify-center gap-3 bg-white text-sm text-slate-500 dark:bg-[#19151f] dark:text-slate-300">
+              <WifiOff className="h-8 w-8 text-slate-300 dark:text-slate-600" />
+              <div className="font-semibold text-slate-800 dark:text-white">No option-chain rows loaded</div>
+              <div className="max-w-md text-center text-xs">Check that the Upstox token is saved or the proxy is running, then refresh the chain.</div>
+              <Button variant="outline" className="h-8 text-xs" onClick={() => refetch()}>
+                <RefreshCw className="mr-2 h-3.5 w-3.5" />
+                Refresh
+              </Button>
+            </div>
+          ) : (
+            <table className="w-full min-w-[1500px] border-collapse text-[12px]">
+              <thead className="sticky top-0 z-20 bg-white dark:bg-[#19151f]">
+                <tr className="h-9 border-b border-slate-200 text-[12px] text-slate-600 dark:border-[#3b3344] dark:text-white">
+                  <th className="px-3 text-left font-semibold">Volume</th>
+                  <th className="px-3 text-right font-semibold">IV</th>
+                  <th className="px-3 text-right font-semibold">Vega</th>
+                  <th className="px-3 text-right font-semibold">Gamma</th>
+                  <th className="px-3 text-right font-semibold">Theta</th>
+                  <th className="px-3 text-right font-semibold">Delta</th>
+                  <th className="px-3 text-right font-semibold">OI <span className="text-[10px]">(chg)</span></th>
+                  <th className="px-3 text-right font-semibold">OI <span className="text-[10px]">(lakhs)</span></th>
+                  <th className="px-3 text-right font-semibold">LTP</th>
+                  <th className="w-[92px] border-x border-slate-200 bg-slate-50 px-3 text-center font-semibold dark:border-[#3b3344] dark:bg-[#211b28]">Strike</th>
+                  <th className="px-3 text-left font-semibold">LTP</th>
+                  <th className="px-3 text-left font-semibold">OI <span className="text-[10px]">(lakhs)</span></th>
+                  <th className="px-3 text-left font-semibold">OI <span className="text-[10px]">(chg)</span></th>
+                  <th className="px-3 text-left font-semibold">Delta</th>
+                  <th className="px-3 text-left font-semibold">Theta</th>
+                  <th className="px-3 text-left font-semibold">Gamma</th>
+                  <th className="px-3 text-left font-semibold">Vega</th>
+                  <th className="px-3 text-left font-semibold">IV</th>
+                  <th className="px-3 text-left font-semibold">Volume</th>
+                </tr>
+              </thead>
+              <tbody>
+                {enrichedChain.map((row, idx) => {
+                  const cePrev = previousOiFor(row.ce);
+                  const pePrev = previousOiFor(row.pe);
+                  const ceOiChange = oiChangeFor(row.ce);
+                  const peOiChange = oiChangeFor(row.pe);
+                  const pcrRow = row.ce.oi ? row.pe.oi / row.ce.oi : 0;
+                  const ceItm = row.strikePrice < spotPrice;
+                  const peItm = row.strikePrice > spotPrice;
+                  const showSpot = spotInsertIndex === idx;
+                  return (
+                    <Fragment key={row.strikePrice}>
+                      {showSpot && (
+                        <tr className="h-6 border-y border-slate-200 bg-white text-center text-[11px] font-semibold dark:border-[#3b3344] dark:bg-[#19151f]">
+                          <td colSpan={9}></td>
+                          <td className="border-x border-slate-200 dark:border-[#3b3344]">Spot <span className="text-emerald-700 dark:text-emerald-400">▲ {fmtNum(spotPrice, 2)}</span></td>
+                          <td colSpan={9}></td>
+                        </tr>
+                      )}
+                      <tr key={row.strikePrice} className="h-[49px] border-b border-slate-200 hover:bg-violet-50/40 dark:border-[#3b3344] dark:hover:bg-violet-500/10">
+                        <td className={`px-3 text-left ${ceItm ? "bg-amber-50 dark:bg-[#2d2522]" : ""}`}>{fmtCompactIN(row.ce.volume)}</td>
+                        <td className={`px-3 text-right ${ceItm ? "bg-amber-50 dark:bg-[#2d2522]" : ""}`}>{fmtNum(row.ce.iv, 2)}</td>
+                        <td className={`px-3 text-right ${ceItm ? "bg-amber-50 dark:bg-[#2d2522]" : ""}`}>{fmtNum(row.ce.vega, 4)}</td>
+                        <td className={`px-3 text-right ${ceItm ? "bg-amber-50 dark:bg-[#2d2522]" : ""}`}>{fmtNum(row.ce.gamma, 4)}</td>
+                        <td className={`px-3 text-right ${ceItm ? "bg-amber-50 dark:bg-[#2d2522]" : ""}`}>{fmtNum(row.ce.theta, 4)}</td>
+                        <td className={`px-3 text-right ${ceItm ? "bg-amber-50 dark:bg-[#2d2522]" : ""}`}>{fmtNum(row.ce.delta, 4)}</td>
+                        <td className={`px-3 text-right ${ceItm ? "bg-amber-50 dark:bg-[#2d2522]" : ""}`}>{fmtSigned(ceOiChange)}</td>
+                        <td className={`px-3 ${ceItm ? "bg-amber-50 dark:bg-[#2d2522]" : ""}`}><TerminalOiCell value={row.ce.oi} previous={cePrev} max={terminalMaxOI} align="right" /></td>
+                        <td className={`px-3 text-right ${ceItm ? "bg-amber-50 dark:bg-[#2d2522]" : ""}`}>
+                          <button onClick={() => quickTrade(row.strikePrice, "CE", "BUY")} className="font-medium text-emerald-700 hover:underline dark:text-emerald-400">{fmtNum(row.ce.ltp, 2)}</button>
+                          <div className="text-[10px] text-slate-700 dark:text-slate-100">+{Math.abs(row.ce.ltp / Math.max(row.strikePrice, 1) * 100).toFixed(2)} %</div>
+                        </td>
+                        <td className="border-x border-slate-200 bg-slate-50 px-3 text-center dark:border-[#3b3344] dark:bg-[#211b28]">
+                          <div className="font-bold text-slate-900 dark:text-slate-200">{row.strikePrice.toLocaleString("en-IN")}</div>
+                          <div className="text-[10px] text-slate-500 dark:text-slate-100">PCR: {pcrRow.toFixed(2)}</div>
+                        </td>
+                        <td className={`px-3 text-left ${peItm ? "bg-amber-50 dark:bg-[#2d2522]" : ""}`}>
+                          <button onClick={() => quickTrade(row.strikePrice, "PE", "BUY")} className="font-medium text-orange-600 hover:underline dark:text-orange-400">{fmtNum(row.pe.ltp, 2)}</button>
+                          <div className="text-[10px] text-slate-700 dark:text-slate-100">-{Math.abs(row.pe.ltp / Math.max(row.strikePrice, 1) * 100).toFixed(2)} %</div>
+                        </td>
+                        <td className={`px-3 ${peItm ? "bg-amber-50 dark:bg-[#2d2522]" : ""}`}><TerminalOiCell value={row.pe.oi} previous={pePrev} max={terminalMaxOI} align="left" /></td>
+                        <td className={`px-3 text-left ${peItm ? "bg-amber-50 dark:bg-[#2d2522]" : ""}`}>{fmtSigned(peOiChange)}</td>
+                        <td className={`px-3 text-left ${peItm ? "bg-amber-50 dark:bg-[#2d2522]" : ""}`}>{fmtNum(row.pe.delta, 4)}</td>
+                        <td className={`px-3 text-left ${peItm ? "bg-amber-50 dark:bg-[#2d2522]" : ""}`}>{fmtNum(row.pe.theta, 4)}</td>
+                        <td className={`px-3 text-left ${peItm ? "bg-amber-50 dark:bg-[#2d2522]" : ""}`}>{fmtNum(row.pe.gamma, 4)}</td>
+                        <td className={`px-3 text-left ${peItm ? "bg-amber-50 dark:bg-[#2d2522]" : ""}`}>{fmtNum(row.pe.vega, 4)}</td>
+                        <td className={`px-3 text-left ${peItm ? "bg-amber-50 dark:bg-[#2d2522]" : ""}`}>{fmtNum(row.pe.iv, 2)}</td>
+                        <td className={`px-3 text-left ${peItm ? "bg-amber-50 dark:bg-[#2d2522]" : ""}`}>{fmtCompactIN(row.pe.volume)}</td>
+                      </tr>
+                    </Fragment>
+                  );
+                })}
+              </tbody>
+            </table>
+          )}
+        </div>
+
+        <div className="flex h-12 items-center justify-between border-t border-slate-200 bg-white px-4 dark:border-[#3b3344] dark:bg-[#19151f]">
+          <div className="flex flex-1 items-center justify-center gap-5 text-[11px] text-slate-700 dark:text-white">
+            <span className="inline-flex items-center gap-1"><span className="h-3 w-3 rounded-sm bg-amber-500 dark:bg-[#f1c46b]" /> Today's OI</span>
+            <span className="inline-flex items-center gap-1"><span className="h-3 w-3 rounded-sm bg-amber-700 dark:bg-[#b78a43]" /> Yesterday's OI</span>
+          </div>
+          <Button className="h-8 w-40 rounded bg-violet-800 text-xs font-semibold text-white hover:bg-violet-900 dark:bg-[#8d6bc5] dark:hover:bg-[#9b78d1]" onClick={() => navigate("/strategy")}>
+            Build Strategy
+          </Button>
+        </div>
+      </div>
+    </div>
+  );
+
   return (
     <div className="space-y-2.5 lg:space-y-3">
       {/* Header Bar */}
@@ -540,7 +765,7 @@ export default function OptionChain() {
         <div className="flex items-center gap-1.5">
           <Badge variant="outline" className={`gap-1 text-[11px] ${isLive ? "border-bullish/50 text-bullish" : afterHours ? "border-amber-500/50 text-amber-400" : "border-red-500/30 text-red-400"}`}>
             {isLive ? <Wifi className="h-3 w-3" /> : <WifiOff className="h-3 w-3" />}
-            {isLive ? (data?.source === "dhan" ? "DHAN" : "NSE") : afterHours ? "CLOSED" : "OFFLINE"}
+            {isLive ? (data?.source === "upstox" ? "UPSTOX TICK" : data?.source === "dhan" ? "DHAN" : "NSE") : afterHours ? "CLOSED" : "OFFLINE"}
           </Badge>
           <span className="text-xs font-mono">
             {symbol} <span className="font-semibold text-foreground">{spotPrice.toLocaleString("en-IN", { minimumFractionDigits: 2 })}</span>

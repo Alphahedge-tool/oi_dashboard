@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { useQueryClient } from "@tanstack/react-query";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -16,7 +17,9 @@ import {
   type BrokerInfo,
   type BrokerCredentials,
 } from "@/lib/brokerConfig";
+import { resetProxyStatus } from "@/hooks/useMarketData";
 import { testDhanConnection } from "@/lib/marketApi";
+import { upstoxWS } from "@/lib/upstoxWebSocket";
 import { useProxyHealth } from "@/hooks/useMarketData";
 import { useWebSocketStatus } from "@/hooks/useWebSocket";
 import {
@@ -285,30 +288,51 @@ function ConnectionStatusPanel() {
 }
 
 export default function BrokerSettings() {
+  const queryClient = useQueryClient();
   const [savedBrokers, setSavedBrokers] = useState(getSavedBrokers());
   const activeBroker = getActiveBroker();
 
+  const refreshMarketData = () => {
+    resetProxyStatus();
+    queryClient.invalidateQueries();
+  };
+
   const handleSave = (brokerId: string, values: Record<string, string>) => {
+    const shouldActivate = brokerId === "upstox" || savedBrokers.length === 0 || activeBroker?.brokerId === brokerId;
     const creds: BrokerCredentials = {
       brokerId,
       values,
       addedAt: new Date().toISOString(),
-      isActive: savedBrokers.length === 0, // first broker is auto-active
+      isActive: shouldActivate,
     };
     saveBrokerCredentials(creds);
+    if (shouldActivate) setActiveBroker(brokerId);
+    if (brokerId === "upstox") {
+      upstoxWS.disconnect();
+      upstoxWS.connect(values.accessToken);
+    }
     setSavedBrokers(getSavedBrokers());
+    refreshMarketData();
     toast.success(`${BROKERS.find((b) => b.id === brokerId)?.name} keys saved securely`);
   };
 
   const handleRemove = (brokerId: string) => {
     removeBrokerCredentials(brokerId);
+    if (brokerId === "upstox") upstoxWS.disconnect();
     setSavedBrokers(getSavedBrokers());
+    refreshMarketData();
     toast.info("Broker keys removed");
   };
 
   const handleSetActive = (brokerId: string) => {
     setActiveBroker(brokerId);
+    if (brokerId === "upstox") {
+      const upstox = getSavedBrokers().find((b) => b.brokerId === "upstox");
+      upstoxWS.disconnect();
+      upstoxWS.connect(upstox?.values.accessToken);
+    }
     setSavedBrokers(getSavedBrokers());
+    refreshMarketData();
     toast.success(`${BROKERS.find((b) => b.id === brokerId)?.name} is now active`);
   };
 

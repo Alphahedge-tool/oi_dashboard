@@ -5,6 +5,7 @@ import { getMaxPain } from "@/lib/oiUtils";
 import { getLotSize } from "@/lib/positionStore";
 import type { OptionData, IndexData, ExpiryDate } from "@/lib/mockData";
 import { useWebSocketIndices, useWebSocketVix, useWebSocketStatus } from "@/hooks/useWebSocket";
+import { useUpstoxFeedStatus, useUpstoxIndexTicks } from "@/hooks/useUpstoxIndexTicks";
 import { useMemo, useEffect, useState, useRef } from "react";
 import {
   getAllPriceSnapshots,
@@ -76,6 +77,7 @@ function buildCachedIndices(prices: PriceSnapshot[]): IndexData[] {
 // ── Hook: Live Indices (WebSocket primary, polling fallback, DB cache tertiary) ──
 // NO MOCK FALLBACK — returns empty array when offline
 export function useLiveIndices() {
+  const { indices: upstoxIndices, connected: upstoxConnected } = useUpstoxIndexTicks();
   const { indices: wsIndices, isConnected: wsConnected } = useWebSocketIndices();
 
   const pollingQuery = useQuery({
@@ -96,16 +98,17 @@ export function useLiveIndices() {
       // NO MOCK — return empty
       return { data: [] as IndexData[], isLive: false };
     },
-    refetchInterval: wsConnected ? 120000 : ((query) => query.state.data?.isLive ? 15000 : 60000),
+    refetchInterval: upstoxConnected || wsConnected ? 120000 : ((query) => query.state.data?.isLive ? 15000 : 60000),
     staleTime: 10000,
     retry: 1,
   });
 
   // Merge WebSocket data over polling data
   const mergedData = useMemo(() => {
-    if (wsIndices.length > 0) {
+    const liveIndices = upstoxIndices.length > 0 ? upstoxIndices : wsIndices;
+    if (liveIndices.length > 0) {
       const polledData = pollingQuery.data?.data || [];
-      const merged = wsIndices.map((wsIdx) => {
+      const merged = liveIndices.map((wsIdx) => {
         const polled = polledData.find((p: any) => p.symbol === wsIdx.symbol);
         return {
           name: wsIdx.name,
@@ -130,11 +133,11 @@ export function useLiveIndices() {
     }
 
     return pollingQuery.data || { data: [] as IndexData[], isLive: false };
-  }, [wsIndices, pollingQuery.data]);
+  }, [upstoxIndices, wsIndices, pollingQuery.data]);
 
   return {
     data: mergedData,
-    isLoading: pollingQuery.isLoading && wsIndices.length === 0,
+    isLoading: pollingQuery.isLoading && upstoxIndices.length === 0 && wsIndices.length === 0,
   };
 }
 
@@ -242,6 +245,7 @@ export function useExpiryList(symbol: string) {
 export function useAllIndices() {
   const { vix: wsVix } = useWebSocketVix();
   const wsConnected = useWebSocketStatus();
+  const upstoxConnected = useUpstoxFeedStatus();
 
   const pollingQuery = useQuery({
     queryKey: ["nse-all-indices"],
@@ -262,7 +266,7 @@ export function useAllIndices() {
         isLive: false,
       };
     },
-    refetchInterval: wsConnected ? 120000 : ((query) => query.state.data?.isLive ? 30000 : 120000),
+    refetchInterval: upstoxConnected || wsConnected ? 120000 : ((query) => query.state.data?.isLive ? 30000 : 120000),
     staleTime: 15000,
     retry: 1,
   });

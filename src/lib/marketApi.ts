@@ -25,6 +25,23 @@ async function fetchDhanProxy(endpoint: string, params?: Record<string, string>)
   return res.json();
 }
 
+async function fetchUpstoxProxy(endpoint: "option-chain" | "expiry-list", params?: Record<string, string>): Promise<any> {
+  const activeBroker = getActiveBroker();
+  const headers: Record<string, string> = {};
+  if (activeBroker?.brokerId === "upstox" && activeBroker.values.accessToken) {
+    headers["x-upstox-access-token"] = activeBroker.values.accessToken;
+  }
+
+  const qp = new URLSearchParams(params);
+  const path = endpoint === "option-chain" ? "/api/upstox-option-chain" : "/api/upstox-expiries";
+  const res = await fetch(`${PROXY_BASE}${path}?${qp.toString()}`, { headers });
+  if (!res.ok) {
+    const errText = await res.text();
+    throw new Error(`Upstox proxy error ${res.status}: ${errText}`);
+  }
+  return res.json();
+}
+
 // NSE proxy for indices & market status
 async function fetchNSEProxy(endpoint: string, symbol?: string): Promise<any> {
   const params = new URLSearchParams({ endpoint });
@@ -122,6 +139,7 @@ export function parseDhanOptionChain(raw: DhanOptionChainData): {
         ce: {
           ltp: legData.ce?.last_price || legData.ce?.ltp || 0,
           oi: ceOI,
+          previousOi: legData.ce?.previous_oi || ceOI,
           oiChange: legData.ce?.oi_chg || (ceOI - (legData.ce?.previous_oi || ceOI)),
           volume: legData.ce?.volume || 0,
           iv: legData.ce?.implied_volatility || legData.ce?.iv || 0,
@@ -135,6 +153,7 @@ export function parseDhanOptionChain(raw: DhanOptionChainData): {
         pe: {
           ltp: legData.pe?.last_price || legData.pe?.ltp || 0,
           oi: peOI,
+          previousOi: legData.pe?.previous_oi || peOI,
           oiChange: legData.pe?.oi_chg || (peOI - (legData.pe?.previous_oi || peOI)),
           volume: legData.pe?.volume || 0,
           iv: legData.pe?.implied_volatility || legData.pe?.iv || 0,
@@ -150,6 +169,108 @@ export function parseDhanOptionChain(raw: DhanOptionChainData): {
     .sort((a, b) => a.strikePrice - b.strikePrice);
 
   return { chain, spotPrice, totalCEOI, totalPEOI };
+}
+
+function pickNumber(...values: any[]): number {
+  for (const value of values) {
+    const n = Number(value);
+    if (Number.isFinite(n)) return n;
+  }
+  return 0;
+}
+
+function pickOptionalNumber(...values: any[]): number | undefined {
+  for (const value of values) {
+    if (value === undefined || value === null || value === "") continue;
+    const n = Number(value);
+    if (Number.isFinite(n)) return n;
+  }
+  return undefined;
+}
+
+function parseUpstoxLeg(option: any) {
+  const md = option?.market_data || option?.marketData || {};
+  const g = option?.option_greeks || option?.optionGreeks || option?.greeks || {};
+  const oi = pickNumber(md.oi, md.open_interest, md.openInterest, option?.oi);
+  const explicitPreviousOi = pickOptionalNumber(
+    md.previous_oi,
+    md.previousOi,
+    md.prev_oi,
+    md.prevOi,
+    md.previous_open_interest,
+    md.previousOpenInterest,
+    option?.previous_oi,
+    option?.previousOi,
+    option?.prev_oi,
+    option?.prevOi,
+  );
+  const explicitOiChange = pickOptionalNumber(
+    md.oi_change,
+    md.oiChange,
+    md.oi_chg,
+    md.change_oi,
+    md.changeOi,
+    md.changeinOpenInterest,
+    option?.oi_change,
+    option?.oiChange,
+    option?.oi_chg,
+    option?.changeinOpenInterest,
+  );
+  const previousOi = explicitPreviousOi ?? (explicitOiChange !== undefined ? oi - explicitOiChange : undefined);
+  return {
+    instrumentKey: option?.instrument_key || option?.instrumentKey || "",
+    ltp: pickNumber(md.ltp, md.last_price, md.lastPrice, option?.ltp),
+    oi,
+    previousOi,
+    oiChange: explicitOiChange ?? (previousOi !== undefined ? oi - previousOi : 0),
+    volume: pickNumber(md.volume, md.vol, option?.volume),
+    iv: pickNumber(option?.iv, md.iv, g.iv, option?.implied_volatility),
+    delta: pickNumber(g.delta, option?.delta),
+    gamma: pickNumber(g.gamma, option?.gamma),
+    theta: pickNumber(g.theta, option?.theta),
+    vega: pickNumber(g.vega, option?.vega),
+    bidPrice: pickNumber(md.bid_price, md.bidPrice, option?.bid_price),
+    askPrice: pickNumber(md.ask_price, md.askPrice, option?.ask_price),
+  };
+}
+
+export function parseUpstoxOptionChain(raw: any): {
+  chain: OptionData[];
+  spotPrice: number;
+  totalCEOI: number;
+  totalPEOI: number;
+} {
+  const rows = Array.isArray(raw?.data)
+    ? raw.data
+    : Array.isArray(raw?.option_chain)
+    ? raw.option_chain
+    : Array.isArray(raw?.records)
+    ? raw.records
+    : [];
+
+  let totalCEOI = 0;
+  let totalPEOI = 0;
+  const chain = rows
+    .map((entry: any) => {
+      const ce = parseUpstoxLeg(entry?.call_options || entry?.callOptions || {});
+      const pe = parseUpstoxLeg(entry?.put_options || entry?.putOptions || {});
+      totalCEOI += ce.oi;
+      totalPEOI += pe.oi;
+      return {
+        strikePrice: pickNumber(entry?.strike_price, entry?.strikePrice),
+        ce,
+        pe,
+      };
+    })
+    .filter((row: OptionData) => row.strikePrice > 0)
+    .sort((a: OptionData, b: OptionData) => a.strikePrice - b.strikePrice);
+
+  return {
+    chain,
+    spotPrice: pickNumber(raw?.underlying_spot_price, raw?.underlyingSpotPrice, raw?.data?.underlying_spot_price),
+    totalCEOI,
+    totalPEOI,
+  };
 }
 
 // ── Parse NSE Indices Response (kept for Dashboard) ──
@@ -223,12 +344,14 @@ export function parseNSEOptionChain(raw: NSEOptionChainResponse, selectedExpiry?
       strikePrice: item.strikePrice,
       ce: item.CE ? {
         ltp: item.CE.lastPrice, oi: item.CE.openInterest, oiChange: item.CE.changeinOpenInterest,
+        previousOi: item.CE.openInterest - (item.CE.changeinOpenInterest || 0),
         volume: item.CE.totalTradedVolume, iv: item.CE.impliedVolatility,
         delta: 0, gamma: 0, theta: 0, vega: 0,
         bidPrice: item.CE.bidprice, askPrice: item.CE.askPrice,
       } : defaultLeg,
       pe: item.PE ? {
         ltp: item.PE.lastPrice, oi: item.PE.openInterest, oiChange: item.PE.changeinOpenInterest,
+        previousOi: item.PE.openInterest - (item.PE.changeinOpenInterest || 0),
         volume: item.PE.totalTradedVolume, iv: item.PE.impliedVolatility,
         delta: 0, gamma: 0, theta: 0, vega: 0,
         bidPrice: item.PE.bidprice, askPrice: item.PE.askPrice,
@@ -241,9 +364,48 @@ export function parseNSEOptionChain(raw: NSEOptionChainResponse, selectedExpiry?
 
 // ── Exported fetch functions ──
 
-// Dhan Option Chain (primary) with NSE fallback
+// Upstox Option Chain (primary) with NSE fallback
 export async function fetchLiveOptionChain(symbol: string, expiry?: string) {
-  // Try Dhan first
+  // Try Upstox first (Trishakti data path)
+  try {
+    let selectedExpiry = expiry;
+    let expiries: ExpiryDate[] = [];
+
+    const expiryRaw = await fetchUpstoxProxy("expiry-list", { symbol: symbol.toUpperCase() });
+    if (expiryRaw?.data?.length) {
+      expiries = expiryRaw.data.map((dateStr: string) => {
+        const d = new Date(`${dateStr}T00:00:00+05:30`);
+        const days = Math.max(0, Math.ceil((d.getTime() - Date.now()) / (1000 * 60 * 60 * 24)));
+        return {
+          label: d.toLocaleDateString("en-IN", { day: "numeric", month: "short", year: "numeric" }),
+          value: dateStr,
+          daysToExpiry: days,
+        };
+      });
+      selectedExpiry ||= expiryRaw.data[0];
+    }
+
+    if (selectedExpiry) {
+      const raw = await fetchUpstoxProxy("option-chain", {
+        symbol: symbol.toUpperCase(),
+        expiry: selectedExpiry,
+      });
+      const parsed = parseUpstoxOptionChain(raw);
+      if (parsed.chain.length) {
+        return {
+          ...parsed,
+          expiries,
+          source: "upstox" as const,
+          afterHours: false,
+          cachedAt: null,
+        };
+      }
+    }
+  } catch (e) {
+    console.warn("Upstox option chain fetch failed, trying NSE:", e);
+  }
+
+  // Legacy Dhan fallback, useful if the user still has old keys configured
   try {
     const params: Record<string, string> = { symbol: symbol.toUpperCase() };
     if (expiry) params.expiry = expiry;
@@ -289,8 +451,25 @@ export async function fetchLiveOptionChain(symbol: string, expiry?: string) {
   }
 }
 
-// Dhan expiry list
+// Upstox expiry list
 export async function fetchExpiryList(symbol: string): Promise<ExpiryDate[]> {
+  try {
+    const raw = await fetchUpstoxProxy("expiry-list", { symbol: symbol.toUpperCase() });
+    if (raw?.data) {
+      return raw.data.map((dateStr: string) => {
+        const d = new Date(`${dateStr}T00:00:00+05:30`);
+        const days = Math.max(0, Math.ceil((d.getTime() - Date.now()) / (1000 * 60 * 60 * 24)));
+        return {
+          label: d.toLocaleDateString("en-IN", { day: "numeric", month: "short", year: "numeric" }),
+          value: dateStr,
+          daysToExpiry: days,
+        };
+      });
+    }
+  } catch (e) {
+    console.warn("Upstox expiry list fetch failed:", e);
+  }
+
   try {
     const raw = await fetchDhanProxy("expiry-list", { symbol: symbol.toUpperCase() });
     if (raw?.data) {
@@ -508,6 +687,43 @@ export async function testDhanConnection(): Promise<{ status: string; message: s
 export async function fetchProxyHealth(): Promise<any> {
   const res = await fetch(`${PROXY_BASE}/health`);
   if (!res.ok) throw new Error(`Health check failed: ${res.status}`);
+  return res.json();
+}
+
+function getSavedBrokerById(brokerId: string) {
+  try {
+    const raw = localStorage.getItem("optionsdesk_broker_keys");
+    const brokers = raw ? JSON.parse(raw) : [];
+    return brokers.find((broker: any) => broker.brokerId === brokerId) || null;
+  } catch {
+    return null;
+  }
+}
+
+function getNubraHeaders(): Record<string, string> {
+  const nubra = getSavedBrokerById("nubra");
+  if (!nubra) return {};
+  return {
+    ...(nubra.values.sessionToken ? { "x-session-token": nubra.values.sessionToken } : {}),
+    ...(nubra.values.authToken ? { "x-auth-token": nubra.values.authToken } : {}),
+    ...(nubra.values.deviceId ? { "x-device-id": nubra.values.deviceId } : {}),
+    ...(nubra.values.rawCookie ? { "x-raw-cookie": nubra.values.rawCookie } : {}),
+  };
+}
+
+export async function fetchNubraInstruments(): Promise<any> {
+  const res = await fetch(`${PROXY_BASE}/api/nubra-instruments`, { headers: getNubraHeaders() });
+  if (!res.ok) throw new Error(`Nubra instruments error ${res.status}: ${await res.text()}`);
+  return res.json();
+}
+
+export async function fetchNubraTimeseries(chart: string, query: any[]): Promise<any> {
+  const res = await fetch(`${PROXY_BASE}/api/nubra-timeseries`, {
+    method: "POST",
+    headers: { ...getNubraHeaders(), "Content-Type": "application/json" },
+    body: JSON.stringify({ chart, query }),
+  });
+  if (!res.ok) throw new Error(`Nubra timeseries error ${res.status}: ${await res.text()}`);
   return res.json();
 }
 
