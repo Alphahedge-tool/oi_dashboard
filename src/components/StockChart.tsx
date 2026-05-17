@@ -47,34 +47,46 @@ function ChartCore({
 
     const container = chartContainerRef.current;
     const isDark = document.documentElement.classList.contains("dark");
+    const chartSurface = isDark ? "#0f171a" : "#ffffff";
+    const mutedText = isDark ? "#92a4aa" : "#64748b";
+    const gridColor = isDark ? "rgba(127,127,127,0.12)" : "rgba(15,23,42,0.08)";
+    const borderColor = isDark ? "rgba(127,127,127,0.18)" : "rgba(15,23,42,0.12)";
+    const upColor = isDark ? "#4fe0a0" : "#0f9f6e";
+    const downColor = isDark ? "#ff746f" : "#dc2626";
 
     const chart = createChart(container, {
       width: container.clientWidth,
       height,
       layout: {
-        background: { type: ColorType.Solid, color: "transparent" },
-        textColor: isDark ? "#a1a1aa" : "#71717a",
-        fontFamily: "'Inter', 'SF Pro', system-ui, sans-serif",
+        background: { type: ColorType.Solid, color: chartSurface },
+        textColor: mutedText,
+        fontFamily: "'JetBrains Mono', 'Inter', system-ui, sans-serif",
         fontSize: 11,
       },
       grid: {
-        vertLines: { color: isDark ? "rgba(255,255,255,0.04)" : "rgba(0,0,0,0.04)" },
-        horzLines: { color: isDark ? "rgba(255,255,255,0.04)" : "rgba(0,0,0,0.04)" },
+        vertLines: { color: gridColor },
+        horzLines: { color: gridColor },
       },
       crosshair: {
-        vertLine: { color: isDark ? "rgba(255,255,255,0.2)" : "rgba(0,0,0,0.15)", width: 1, style: 2 },
-        horzLine: { color: isDark ? "rgba(255,255,255,0.2)" : "rgba(0,0,0,0.15)", width: 1, style: 2 },
+        mode: 1,
+        vertLine: { color: isDark ? "rgba(66,211,199,0.42)" : "rgba(13,148,136,0.35)", width: 1, style: 2, labelBackgroundColor: isDark ? "#123432" : "#ccfbf1" },
+        horzLine: { color: isDark ? "rgba(66,211,199,0.42)" : "rgba(13,148,136,0.35)", width: 1, style: 2, labelBackgroundColor: isDark ? "#123432" : "#ccfbf1" },
       },
       rightPriceScale: {
-        borderVisible: false,
+        borderVisible: true,
+        borderColor,
         scaleMargins: { top: 0.1, bottom: 0.25 },
       },
       timeScale: {
-        borderVisible: false,
-        timeVisible: range === "1W",
+        borderVisible: true,
+        borderColor,
+        timeVisible: true,
         secondsVisible: false,
         rightOffset: 3,
         minBarSpacing: range === "1W" ? 3 : 4,
+      },
+      localization: {
+        locale: "en-IN",
       },
       handleScroll: { mouseWheel: true, pressedMouseMove: true },
       handleScale: { mouseWheel: true, pinch: true },
@@ -93,18 +105,17 @@ function ChartCore({
 
     if (chartType === "candle") {
       const candleSeries = chart.addSeries(CandlestickSeries, {
-        upColor: "#22c55e",
-        downColor: "#ef4444",
-        borderUpColor: "#22c55e",
-        borderDownColor: "#ef4444",
-        wickUpColor: "#22c55e",
-        wickDownColor: "#ef4444",
+        upColor,
+        downColor,
+        borderVisible: false,
+        wickUpColor: upColor,
+        wickDownColor: downColor,
       });
       candleSeries.setData(formattedCandles);
     } else {
       const isPositive = candles[candles.length - 1].close >= candles[0].close;
       const lineSeries = chart.addSeries(LineSeries, {
-        color: isPositive ? "#22c55e" : "#ef4444",
+        color: isPositive ? upColor : downColor,
         lineWidth: 2,
         crosshairMarkerVisible: true,
         crosshairMarkerRadius: 4,
@@ -122,14 +133,14 @@ function ChartCore({
         value: c.volume!,
         color:
           i > 0 && c.close >= arr[i - 1].close
-            ? "rgba(34, 197, 94, 0.25)"
-            : "rgba(239, 68, 68, 0.2)",
+            ? (isDark ? "rgba(79,224,160,0.34)" : "rgba(15,159,110,0.22)")
+            : (isDark ? "rgba(255,116,111,0.32)" : "rgba(220,38,38,0.18)"),
       }));
 
     if (volumeData.length > 0) {
       const volumeSeries = chart.addSeries(HistogramSeries, {
         priceFormat: { type: "volume" },
-        priceScaleId: "volume",
+        priceScaleId: "",
       });
       volumeSeries.priceScale().applyOptions({
         scaleMargins: { top: 0.8, bottom: 0 },
@@ -166,7 +177,7 @@ function ChartCore({
       : 0;
 
   return (
-    <div className="space-y-2">
+    <div className="space-y-2 rounded border border-slate-200 bg-white p-2 dark:border-[#223036] dark:bg-[#0f171a]">
       {/* Controls */}
       <div className="flex items-center justify-between gap-2">
         <div className="flex items-center gap-2">
@@ -174,13 +185,13 @@ function ChartCore({
             type="single"
             value={range}
             onValueChange={(v) => v && setRange(v as TimeRange)}
-            className="bg-muted rounded-md p-0.5"
+            className="rounded bg-slate-100 p-0.5 dark:bg-[#111c20]"
           >
             {TIME_RANGES.map((r) => (
               <ToggleGroupItem
                 key={r}
                 value={r}
-                className="text-xs h-6 px-2.5 data-[state=on]:bg-background data-[state=on]:shadow-sm rounded"
+                className="h-6 rounded px-2.5 text-xs data-[state=on]:bg-white data-[state=on]:text-teal-800 data-[state=on]:shadow-sm dark:data-[state=on]:bg-[#123432] dark:data-[state=on]:text-[#d8fffb]"
               >
                 {r}
               </ToggleGroupItem>
@@ -191,12 +202,12 @@ function ChartCore({
             type="single"
             value={chartType}
             onValueChange={(v) => v && setChartType(v as "candle" | "line")}
-            className="bg-muted rounded-md p-0.5"
+            className="rounded bg-slate-100 p-0.5 dark:bg-[#111c20]"
           >
-            <ToggleGroupItem value="candle" className="h-6 w-7 p-0 data-[state=on]:bg-background data-[state=on]:shadow-sm rounded">
+            <ToggleGroupItem value="candle" className="h-6 w-7 rounded p-0 data-[state=on]:bg-white data-[state=on]:text-teal-800 data-[state=on]:shadow-sm dark:data-[state=on]:bg-[#123432] dark:data-[state=on]:text-[#d8fffb]">
               <CandlestickChart className="h-3.5 w-3.5" />
             </ToggleGroupItem>
-            <ToggleGroupItem value="line" className="h-6 w-7 p-0 data-[state=on]:bg-background data-[state=on]:shadow-sm rounded">
+            <ToggleGroupItem value="line" className="h-6 w-7 rounded p-0 data-[state=on]:bg-white data-[state=on]:text-teal-800 data-[state=on]:shadow-sm dark:data-[state=on]:bg-[#123432] dark:data-[state=on]:text-[#d8fffb]">
               <LineChart className="h-3.5 w-3.5" />
             </ToggleGroupItem>
           </ToggleGroup>
@@ -236,7 +247,7 @@ function ChartCore({
             Chart data unavailable. Start the proxy server for live data.
           </div>
         )}
-        <div ref={chartContainerRef} className="w-full rounded-lg overflow-hidden" />
+        <div ref={chartContainerRef} className="w-full overflow-hidden rounded bg-white dark:bg-[#0f171a]" />
         {candles && candles.length === 0 && !isLoading && (
           <div className="flex items-center justify-center h-[200px] text-sm text-muted-foreground">
             No historical data available for {symbol}

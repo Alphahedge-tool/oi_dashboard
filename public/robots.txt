@@ -13,4 +13,4 @@ Allow: /
 User-agent: *
 Allow: /
 
-Sitemap: https://github.com/MrChartist/india-s-best-option-hub/blob/master/public/sitemap.xml
+Sitemap: https://github.com/trishakti/options-terminal/blob/master/public/sitemap.xml

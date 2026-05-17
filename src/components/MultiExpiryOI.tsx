@@ -1,4 +1,4 @@
-import { useState, useMemo } from "react";
+import { memo, useState, useMemo } from "react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Badge } from "@/components/ui/badge";
@@ -6,14 +6,16 @@ import { Switch } from "@/components/ui/switch";
 import { Label } from "@/components/ui/label";
 import { useLiveOptionChain, useExpiryList } from "@/hooks/useMarketData";
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, ReferenceLine, Legend, ComposedChart, Line, Cell } from "recharts";
-import { Layers, TrendingUp, TrendingDown, AlertTriangle } from "lucide-react";
+import { Layers, TrendingUp, TrendingDown, AlertTriangle, Loader2 } from "lucide-react";
 
 interface Props {
   symbol: string;
+  compact?: boolean;
+  showSignals?: boolean;
 }
 
-export function MultiExpiryOI({ symbol }: Props) {
-  const { data: expiryData } = useExpiryList(symbol);
+function MultiExpiryOIComponent({ symbol, compact = false, showSignals = true }: Props) {
+  const { data: expiryData, isLoading: expiriesLoading } = useExpiryList(symbol);
   const expiries = expiryData?.expiries || [];
 
   // Pick first 3 expiries
@@ -21,15 +23,22 @@ export function MultiExpiryOI({ symbol }: Props) {
   const exp2 = expiries[1]?.value || "";
   const exp3 = expiries[2]?.value || "";
 
-  const { data: chain1 } = useLiveOptionChain(symbol, exp1);
-  const { data: chain2 } = useLiveOptionChain(symbol, exp2);
-  const { data: chain3 } = useLiveOptionChain(symbol, exp3);
+  const { data: chain1, isLoading: chain1Loading } = useLiveOptionChain(symbol, exp1);
+  const { data: chain2, isLoading: chain2Loading } = useLiveOptionChain(symbol, exp2);
+  const { data: chain3, isLoading: chain3Loading } = useLiveOptionChain(symbol, exp3);
 
   const [showOIChange, setShowOIChange] = useState(false);
   const [selectedExpiries, setSelectedExpiries] = useState<number[]>([0, 1]);
 
-  const spotPrice = chain1?.spotPrice || 0;
-  const stepSize = chain1?.stepSize || 50;
+  const primaryChain = chain1 || chain2 || chain3;
+  const spotPrice = primaryChain?.spotPrice || 0;
+  const stepSize = primaryChain?.stepSize || 50;
+  const isLoading = expiriesLoading || chain1Loading || chain2Loading || chain3Loading;
+  const toK = (value: number) => {
+    const scaled = Number(value || 0) / 1000;
+    if (scaled !== 0 && Math.abs(scaled) < 1) return Number(scaled.toFixed(2));
+    return Number(scaled.toFixed(1));
+  };
 
   // Merge data from multiple expiries
   const mergedData = useMemo(() => {
@@ -39,14 +48,15 @@ export function MultiExpiryOI({ symbol }: Props) {
     chains.forEach((c, idx) => {
       if (!selectedExpiries.includes(idx) || !c) return;
       c.chain.forEach(o => {
-        if (o.ce.oi > 30000 || o.pe.oi > 30000) allStrikes.add(o.strikePrice);
+        if (o.ce.oi > 0 || o.pe.oi > 0 || o.ce.oiChange !== 0 || o.pe.oiChange !== 0) allStrikes.add(o.strikePrice);
       });
     });
 
     const strikes = Array.from(allStrikes).sort((a, b) => a - b);
     // Filter to ±15 strikes from ATM
-    const atm = Math.round(spotPrice / stepSize) * stepSize;
-    const filtered = strikes.filter(s => Math.abs(s - atm) <= stepSize * 15);
+    const fallbackCenter = strikes.length ? strikes[Math.floor(strikes.length / 2)] : 0;
+    const atm = spotPrice ? Math.round(spotPrice / stepSize) * stepSize : fallbackCenter;
+    const filtered = strikes.filter(s => !atm || Math.abs(s - atm) <= stepSize * 15);
 
     return filtered.map(strike => {
       const row: any = { strike };
@@ -55,11 +65,11 @@ export function MultiExpiryOI({ symbol }: Props) {
         const opt = c.chain.find(o => o.strikePrice === strike);
         const suffix = `_exp${idx}`;
         if (showOIChange) {
-          row[`ceOIChg${suffix}`] = opt ? Math.round(opt.ce.oiChange / 1000) : 0;
-          row[`peOIChg${suffix}`] = opt ? Math.round(opt.pe.oiChange / 1000) : 0;
+          row[`ceOIChg${suffix}`] = opt ? toK(opt.ce.oiChange) : 0;
+          row[`peOIChg${suffix}`] = opt ? toK(opt.pe.oiChange) : 0;
         } else {
-          row[`ceOI${suffix}`] = opt ? Math.round(opt.ce.oi / 1000) : 0;
-          row[`peOI${suffix}`] = opt ? Math.round(opt.pe.oi / 1000) : 0;
+          row[`ceOI${suffix}`] = opt ? toK(opt.ce.oi) : 0;
+          row[`peOI${suffix}`] = opt ? toK(opt.pe.oi) : 0;
         }
       });
       return row;
@@ -137,6 +147,9 @@ export function MultiExpiryOI({ symbol }: Props) {
 
   const expiryLabels = expiries.slice(0, 3).map((e, i) => e.label || `Expiry ${i + 1}`);
   const tooltipStyle = { backgroundColor: "hsl(var(--card))", border: "1px solid hsl(var(--border))", borderRadius: "6px", fontSize: "11px" };
+  const hasPlottableData = mergedData.some((row) =>
+    Object.entries(row).some(([key, value]) => key !== "strike" && Number(value) !== 0)
+  );
 
   const toggleExpiry = (idx: number) => {
     setSelectedExpiries(prev =>
@@ -181,37 +194,48 @@ export function MultiExpiryOI({ symbol }: Props) {
           </CardTitle>
         </CardHeader>
         <CardContent>
-          <div className="h-[420px]">
-            <ResponsiveContainer width="100%" height="100%">
-              <BarChart data={mergedData} barGap={1}>
-                <CartesianGrid strokeDasharray="3 3" stroke="hsl(var(--chart-grid))" />
-                <XAxis dataKey="strike" tick={{ fontSize: 9, fill: "hsl(var(--muted-foreground))" }} />
-                <YAxis tick={{ fontSize: 9, fill: "hsl(var(--muted-foreground))" }} />
-                <Tooltip contentStyle={tooltipStyle} formatter={(v: number) => [`${v}K`, ""]} />
-                <Legend wrapperStyle={{ fontSize: "10px" }} />
-                <ReferenceLine x={Math.round(spotPrice / stepSize) * stepSize} stroke="hsl(var(--primary))" strokeDasharray="3 3" label={{ value: "ATM", fill: "hsl(var(--primary))", fontSize: 9 }} />
-                {selectedExpiries.map(idx => {
-                  const suffix = `_exp${idx}`;
-                  const colors = expiryColors[idx];
-                  if (showOIChange) {
+          <div className={compact ? "h-[300px]" : "h-[420px]"}>
+            {isLoading ? (
+              <div className="flex h-full items-center justify-center gap-2 text-sm text-muted-foreground">
+                <Loader2 className="h-4 w-4 animate-spin" />
+                Loading multi-expiry chains...
+              </div>
+            ) : !hasPlottableData ? (
+              <div className="flex h-full items-center justify-center text-sm text-muted-foreground">
+                No multi-expiry OI values returned for the selected expiries.
+              </div>
+            ) : (
+              <ResponsiveContainer width="100%" height="100%" debounce={250}>
+                <BarChart data={mergedData} barGap={1}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="hsl(var(--chart-grid))" />
+                  <XAxis dataKey="strike" tick={{ fontSize: 9, fill: "hsl(var(--muted-foreground))" }} />
+                  <YAxis tick={{ fontSize: 9, fill: "hsl(var(--muted-foreground))" }} />
+                  <Tooltip contentStyle={tooltipStyle} formatter={(v: number) => [`${Number(v).toLocaleString("en-IN")}K`, ""]} />
+                  <Legend wrapperStyle={{ fontSize: "10px" }} />
+                  <ReferenceLine x={Math.round(spotPrice / stepSize) * stepSize} stroke="hsl(var(--primary))" strokeDasharray="3 3" label={{ value: "ATM", fill: "hsl(var(--primary))", fontSize: 9 }} />
+                  {selectedExpiries.map(idx => {
+                    const suffix = `_exp${idx}`;
+                    const colors = expiryColors[idx];
+                    if (showOIChange) {
+                      return [
+                        <Bar key={`ceChg${idx}`} dataKey={`ceOIChg${suffix}`} fill={colors.ce} name={`CE Chg ${expiryLabels[idx] || ""}`} radius={[2, 2, 0, 0]} />,
+                        <Bar key={`peChg${idx}`} dataKey={`peOIChg${suffix}`} fill={colors.pe} name={`PE Chg ${expiryLabels[idx] || ""}`} radius={[2, 2, 0, 0]} />,
+                      ];
+                    }
                     return [
-                      <Bar key={`ceChg${idx}`} dataKey={`ceOIChg${suffix}`} fill={colors.ce} name={`CE Chg ${expiryLabels[idx] || ""}`} radius={[2, 2, 0, 0]} />,
-                      <Bar key={`peChg${idx}`} dataKey={`peOIChg${suffix}`} fill={colors.pe} name={`PE Chg ${expiryLabels[idx] || ""}`} radius={[2, 2, 0, 0]} />,
+                      <Bar key={`ce${idx}`} dataKey={`ceOI${suffix}`} fill={colors.ce} name={`CE OI ${expiryLabels[idx] || ""}`} radius={[2, 2, 0, 0]} />,
+                      <Bar key={`pe${idx}`} dataKey={`peOI${suffix}`} fill={colors.pe} name={`PE OI ${expiryLabels[idx] || ""}`} radius={[2, 2, 0, 0]} />,
                     ];
-                  }
-                  return [
-                    <Bar key={`ce${idx}`} dataKey={`ceOI${suffix}`} fill={colors.ce} name={`CE OI ${expiryLabels[idx] || ""}`} radius={[2, 2, 0, 0]} />,
-                    <Bar key={`pe${idx}`} dataKey={`peOI${suffix}`} fill={colors.pe} name={`PE OI ${expiryLabels[idx] || ""}`} radius={[2, 2, 0, 0]} />,
-                  ];
-                })}
-              </BarChart>
-            </ResponsiveContainer>
+                  })}
+                </BarChart>
+              </ResponsiveContainer>
+            )}
           </div>
         </CardContent>
       </Card>
 
       {/* Buildup/Unwinding Signals */}
-      {buildupAnalysis.length > 0 && (
+      {showSignals && buildupAnalysis.length > 0 && (
         <Card>
           <CardHeader className="pb-2">
             <CardTitle className="text-sm flex items-center gap-2">
@@ -265,3 +289,5 @@ export function MultiExpiryOI({ symbol }: Props) {
     </div>
   );
 }
+
+export const MultiExpiryOI = memo(MultiExpiryOIComponent);

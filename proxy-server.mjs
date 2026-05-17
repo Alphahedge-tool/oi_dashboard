@@ -18,6 +18,7 @@ import { URL } from "node:url";
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, existsSync } from "node:fs";
 import { resolve, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { createHmac, randomUUID } from "node:crypto";
 import { gunzipSync } from "node:zlib";
 import { WebSocketServer, WebSocket } from "ws";
 
@@ -43,7 +44,10 @@ const PORT = parseInt(process.env.PROXY_PORT || "4002", 10);
 const DHAN_BASE = "https://api.dhan.co/v2";
 const NSE_BASE = "https://www.nseindia.com";
 const UPSTOX_INSTRUMENTS_URL = "https://assets.upstox.com/market-quote/instruments/exchange/complete.json.gz";
+const UPSTOX_PUBLIC_CANDLES_URL = "https://service.upstox.com/chart/open/v3/candles";
 const NUBRA_API = "https://api.nubra.io";
+const NUBRA_SDK_VERSION = "0-3-8";
+const RETRYABLE_UPSTOX_STATUS = new Set([408, 425, 429, 500, 502, 503, 504]);
 let upstoxGzipCache = null;
 let upstoxJsonCache = null;
 
@@ -61,6 +65,8 @@ const LAST_GOOD_TTL = 18 * 60 * 60 * 1000; // 18 hours
 // ── Disk-backed persistent cache directory ──
 const CACHE_DIR = resolve(__dirname, ".cache");
 try { mkdirSync(CACHE_DIR, { recursive: true }); } catch { /* ignore */ }
+
+const NUBRA_DEVICE_FILE = join(CACHE_DIR, "nubra_device.json");
 
 function diskCacheKeyToFilename(key) {
   return key.replace(/[^a-zA-Z0-9_-]/g, "_") + ".json";
@@ -94,6 +100,67 @@ async function readJsonBody(req) {
   return raw ? JSON.parse(raw) : {};
 }
 
+function delay(ms) {
+  return new Promise((resolveDelay) => setTimeout(resolveDelay, ms));
+}
+
+function base32Decode(input) {
+  const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+  const clean = String(input || "").replace(/=+$/g, "").replace(/\s+/g, "").toUpperCase();
+  let bits = "";
+  for (const char of clean) {
+    const value = alphabet.indexOf(char);
+    if (value < 0) continue;
+    bits += value.toString(2).padStart(5, "0");
+  }
+  const bytes = [];
+  for (let i = 0; i + 8 <= bits.length; i += 8) {
+    bytes.push(parseInt(bits.slice(i, i + 8), 2));
+  }
+  return Buffer.from(bytes);
+}
+
+function generateTOTP(secret, windowOffset = 0) {
+  const key = base32Decode(secret);
+  const counter = Math.floor(Date.now() / 1000 / 30) + windowOffset;
+  const buf = Buffer.alloc(8);
+  buf.writeUInt32BE(Math.floor(counter / 0x1_0000_0000), 0);
+  buf.writeUInt32BE(counter >>> 0, 4);
+  const hmac = createHmac("sha1", key).update(buf).digest();
+  const offset = hmac[hmac.length - 1] & 0x0f;
+  const code = (
+    ((hmac[offset] & 0x7f) << 24) |
+    (hmac[offset + 1] << 16) |
+    (hmac[offset + 2] << 8) |
+    hmac[offset + 3]
+  ) % 1_000_000;
+  return code.toString().padStart(6, "0");
+}
+
+function getNubraDeviceId() {
+  const envDevice = process.env.NUBRA_DEVICE_ID;
+  if (envDevice) return envDevice;
+  try {
+    if (existsSync(NUBRA_DEVICE_FILE)) {
+      const saved = JSON.parse(readFileSync(NUBRA_DEVICE_FILE, "utf-8"));
+      if (saved?.device_id) return saved.device_id;
+    }
+  } catch { /* regenerate below */ }
+  const deviceId = `${randomUUID()}-sdk-${NUBRA_SDK_VERSION}`;
+  try { writeFileSync(NUBRA_DEVICE_FILE, JSON.stringify({ device_id: deviceId }), "utf-8"); } catch { /* ignore */ }
+  return deviceId;
+}
+
+async function readNubraJson(response) {
+  const text = await response.text();
+  if (!text) return {};
+  try { return JSON.parse(text); } catch { return { raw: text }; }
+}
+
+function nubraCookie(authToken, sessionToken, deviceId) {
+  return `authToken=${authToken || sessionToken || ""}; sessionToken=${sessionToken || ""}; deviceId=${deviceId || getNubraDeviceId()}`;
+}
+
 async function getUpstoxInstrumentGzip() {
   if (upstoxGzipCache) return upstoxGzipCache;
   const response = await fetch(UPSTOX_INSTRUMENTS_URL);
@@ -107,6 +174,35 @@ async function getUpstoxInstrumentsJson() {
   const gz = await getUpstoxInstrumentGzip();
   upstoxJsonCache = JSON.parse(gunzipSync(gz).toString("utf8"));
   return upstoxJsonCache;
+}
+
+async function fetchUpstoxPublicCandles(upstreamUrl, attempt = 0) {
+  const response = await fetch(upstreamUrl, {
+    headers: {
+      accept: "application/json, text/plain, */*",
+      "accept-language": "en-US,en;q=0.9",
+      origin: "https://upstox.com",
+      referer: "https://upstox.com/",
+      "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
+    },
+  });
+
+  if (!response.ok && RETRYABLE_UPSTOX_STATUS.has(response.status) && attempt < 3) {
+    await delay(600 * (attempt + 1));
+    return fetchUpstoxPublicCandles(upstreamUrl, attempt + 1);
+  }
+
+  return response;
+}
+
+function prevTradingDayEodMs(fromMs) {
+  const IST_OFFSET_MS = 5.5 * 3600 * 1000;
+  const d = new Date(Number.isFinite(fromMs) ? fromMs : Date.now());
+  d.setDate(d.getDate() - 1);
+  while (d.getDay() === 0 || d.getDay() === 6) d.setDate(d.getDate() - 1);
+  const istMidnight = new Date(d.getTime() + IST_OFFSET_MS);
+  istMidnight.setUTCHours(23, 59, 59, 999);
+  return istMidnight.getTime() - IST_OFFSET_MS;
 }
 
 const UPSTOX_INDEX_KEYS = {
@@ -160,7 +256,79 @@ async function resolveUpstoxUnderlying(symbol) {
   return { symbol: upper, instrumentKey: hit?.instrument_key || hit?.instrumentKey || "" };
 }
 
-async function handleUpstoxInstruments(_params, res) {
+function compactUpstoxInstrument(item) {
+  const instrumentKey = item?.instrument_key || item?.instrumentKey || "";
+  const tradingSymbol = item?.trading_symbol || item?.tradingsymbol || item?.symbol || item?.name || "";
+  const type = item?.instrument_type || item?.instrumentType || item?.asset_type || "";
+  return {
+    instrumentKey,
+    tradingSymbol,
+    symbol: tradingSymbol,
+    name: item?.name || item?.underlying_symbol || tradingSymbol,
+    exchange: item?.exchange || item?.segment || instrumentKey.split("|")[0] || "",
+    segment: item?.segment || item?.exchange || instrumentKey.split("|")[0] || "",
+    instrumentType: type,
+    underlyingSymbol: item?.underlying_symbol || item?.underlyingSymbol || item?.asset || "",
+    lotSize: item?.lot_size || item?.lotSize || item?.minimum_lot || 0,
+    tickSize: item?.tick_size || item?.tickSize || 0,
+    expiry: item?.expiry || item?.expiry_date || item?.expiryDate || null,
+    strike: item?.strike_price || item?.strikePrice || item?.strike || null,
+  };
+}
+
+async function handleUpstoxInstruments(params, res) {
+  const format = String(params.get("format") || "gzip").toLowerCase();
+  const mode = String(params.get("mode") || "all").toLowerCase();
+  const q = normalizeLookup(params.get("q") || "");
+  const limit = Math.min(Math.max(Number(params.get("limit") || 0), 0), 5000);
+
+  if (format === "json") {
+    const instruments = await getUpstoxInstrumentsJson();
+    const seen = new Set();
+    let items = instruments
+      .map(compactUpstoxInstrument)
+      .filter((item) => item.instrumentKey || item.tradingSymbol);
+
+    if (mode === "tradable" || mode === "underlyings") {
+      items = items.filter((item) => {
+        const type = String(item.instrumentType || "").toUpperCase();
+        return ["EQ", "EQUITY", "INDEX", "FUTIDX", "FUTSTK"].includes(type);
+      });
+    }
+
+    if (mode === "underlyings") {
+      items = items
+        .map((item) => ({
+          ...item,
+          symbol: item.underlyingSymbol || item.tradingSymbol,
+          tradingSymbol: item.underlyingSymbol || item.tradingSymbol,
+        }))
+        .filter((item) => {
+          const key = normalizeLookup(`${item.exchange}:${item.tradingSymbol}`);
+          if (!item.tradingSymbol || seen.has(key)) return false;
+          seen.add(key);
+          return true;
+        });
+    }
+
+    if (q) {
+      items = items.filter((item) =>
+        normalizeLookup(item.tradingSymbol).includes(q) ||
+        normalizeLookup(item.name).includes(q) ||
+        normalizeLookup(item.underlyingSymbol).includes(q) ||
+        normalizeLookup(item.instrumentKey).includes(q)
+      );
+    }
+
+    items.sort((a, b) => String(a.tradingSymbol).localeCompare(String(b.tradingSymbol)));
+    if (limit) items = items.slice(0, limit);
+
+    res.setHeader("Content-Type", "application/json");
+    res.writeHead(200);
+    res.end(JSON.stringify({ status: "success", data: items, count: items.length, mode }));
+    return;
+  }
+
   const gz = await getUpstoxInstrumentGzip();
   res.setHeader("Content-Type", "application/gzip");
   res.setHeader("Content-Length", gz.length);
@@ -186,6 +354,34 @@ async function handleUpstoxExpiries(params) {
   return [...expiries.values()]
     .sort((a, b) => upstoxExpiryMs({ expiry: a }) - upstoxExpiryMs({ expiry: b }))
     .map((raw) => formatUpstoxExpiry(raw));
+}
+
+async function handleUpstoxPublicCandles(params) {
+  const instrumentKey = params.get("instrumentKey");
+  const interval = params.get("interval") || "I1";
+  const from = params.get("from") || String(new Date().setHours(23, 59, 59, 999));
+  const limit = params.get("limit") || "500";
+
+  if (!instrumentKey) throw new Error("instrumentKey is required");
+
+  const upstream = new URL(UPSTOX_PUBLIC_CANDLES_URL);
+  upstream.searchParams.set("instrumentKey", instrumentKey);
+  upstream.searchParams.set("interval", interval === "I1D" ? "1D" : interval);
+  upstream.searchParams.set("limit", limit);
+  if (from) upstream.searchParams.set("from", from);
+
+  const response = await fetchUpstoxPublicCandles(upstream);
+  const json = await response.json().catch(async () => ({ error: await response.text() }));
+  if (!response.ok) {
+    const err = new Error(json?.error || json?.message || `Upstox candles HTTP ${response.status}`);
+    err.statusCode = response.status;
+    throw err;
+  }
+
+  if (!json.data) json.data = {};
+  if (!json.data.meta) json.data.meta = {};
+  json.data.meta.prevTimestamp = prevTradingDayEodMs(Number(from));
+  return json;
 }
 
 async function handleUpstoxOptionChain(params, accessToken) {
@@ -223,11 +419,12 @@ async function handleUpstoxFeedAuthorize(accessToken) {
 }
 
 function nubraProxyHeaders(req) {
-  const sessionToken = req.headers["x-session-token"] || "";
-  const authToken = req.headers["x-auth-token"] || "";
-  const deviceId = req.headers["x-device-id"] || "web";
+  const sessionToken = req.headers["x-session-token"] || process.env.NUBRA_SESSION_TOKEN || "";
+  const authToken = req.headers["x-auth-token"] || process.env.NUBRA_AUTH_TOKEN || "";
+  const deviceId = req.headers["x-device-id"] || process.env.NUBRA_DEVICE_ID || "web";
   const rawCookie =
     req.headers["x-raw-cookie"] ||
+    process.env.NUBRA_RAW_COOKIE ||
     `authToken=${authToken || sessionToken}; sessionToken=${sessionToken}; deviceId=${deviceId}`;
   return {
     accept: "application/json, text/plain, */*",
@@ -242,16 +439,23 @@ function nubraProxyHeaders(req) {
 
 async function handleNubraInstruments(req) {
   const url = new URL(req.url, `http://localhost:${PORT}`);
-  const sessionToken = url.searchParams.get("session_token") || req.headers["x-session-token"];
-  const authToken = url.searchParams.get("auth_token") || req.headers["x-auth-token"];
-  const deviceId = url.searchParams.get("device_id") || req.headers["x-device-id"] || "web";
+  const sessionToken = url.searchParams.get("session_token") || req.headers["x-session-token"] || process.env.NUBRA_SESSION_TOKEN;
+  const authToken = url.searchParams.get("auth_token") || req.headers["x-auth-token"] || process.env.NUBRA_AUTH_TOKEN || "";
+  const deviceId = url.searchParams.get("device_id") || req.headers["x-device-id"] || process.env.NUBRA_DEVICE_ID || "web";
+  const rawCookie =
+    url.searchParams.get("raw_cookie") ||
+    req.headers["x-raw-cookie"] ||
+    process.env.NUBRA_RAW_COOKIE ||
+    `authToken=${authToken || sessionToken}; sessionToken=${sessionToken}; deviceId=${deviceId}`;
   if (!sessionToken) throw new Error("session_token is required");
-  const today = new Date().toISOString().slice(0, 10);
+  const d = new Date();
+  while (d.getUTCDay() === 0 || d.getUTCDay() === 6) d.setUTCDate(d.getUTCDate() - 1);
+  const today = d.toISOString().slice(0, 10);
   const headers = {
     accept: "application/json",
     authorization: `Bearer ${sessionToken}`,
     "x-device-id": deviceId,
-    ...(authToken ? { cookie: `authToken=${authToken}; sessionToken=${sessionToken}` } : {}),
+    cookie: rawCookie,
   };
   const [nseRes, bseRes, indexRes] = await Promise.all([
     fetch(`${NUBRA_API}/refdata/refdata/${today}?exchange=NSE`, { headers }),
@@ -271,14 +475,286 @@ async function handleNubraInstruments(req) {
 async function handleNubraTimeseries(req) {
   const body = await readJsonBody(req);
   if (!Array.isArray(body.query)) throw new Error("query[] is required");
-  const response = await fetch(`${NUBRA_API}/charts/timeseries?chart=${encodeURIComponent(body.chart || "Put_Call_Ratio")}`, {
+  const sessionToken = body.session_token || req.headers["x-session-token"] || process.env.NUBRA_SESSION_TOKEN || "";
+  const authToken = body.auth_token || req.headers["x-auth-token"] || process.env.NUBRA_AUTH_TOKEN || "";
+  const deviceId = body.device_id || req.headers["x-device-id"] || process.env.NUBRA_DEVICE_ID || "web";
+  const rawCookie =
+    body.raw_cookie ||
+    req.headers["x-raw-cookie"] ||
+    process.env.NUBRA_RAW_COOKIE ||
+    `authToken=${authToken || sessionToken}; sessionToken=${sessionToken}; deviceId=${deviceId}`;
+  const authHeaders = nubraProxyHeaders({
+    headers: {
+      ...req.headers,
+      "x-session-token": sessionToken,
+      "x-auth-token": authToken,
+      "x-device-id": deviceId,
+      "x-raw-cookie": rawCookie,
+    },
+  });
+  const chart = typeof body.chart === "string" ? body.chart.trim() : "";
+  const chartParam = chart ? `?chart=${encodeURIComponent(chart)}` : "";
+  const response = await fetch(`${NUBRA_API}/charts/timeseries${chartParam}`, {
     method: "POST",
-    headers: { ...nubraProxyHeaders(req), "content-type": "application/json" },
-    body: JSON.stringify({ chart: body.chart || "Put_Call_Ratio", query: body.query }),
+    headers: { ...authHeaders, "content-type": "application/json" },
+    body: JSON.stringify(chart ? { chart, query: body.query } : { query: body.query }),
   });
   const json = await response.json().catch(async () => ({ error: await response.text() }));
   if (!response.ok) throw new Error(json?.error || `Nubra timeseries HTTP ${response.status}`);
   return json;
+}
+
+async function sendNubraOtp(phone) {
+  if (!phone) throw new Error("phone is required");
+
+  const first = await fetch(`${NUBRA_API}/sendphoneotp`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ phone, skip_totp: false }),
+  });
+  const firstJson = await readNubraJson(first);
+  if (!first.ok || !firstJson.temp_token) {
+    const err = new Error(firstJson?.error || firstJson?.message || `Nubra send OTP HTTP ${first.status}`);
+    err.statusCode = first.status;
+    err.payload = firstJson;
+    throw err;
+  }
+
+  if (firstJson.next === "VERIFY_TOTP") {
+    const second = await fetch(`${NUBRA_API}/sendphoneotp`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-temp-token": firstJson.temp_token,
+      },
+      body: JSON.stringify({ phone, skip_totp: true }),
+    });
+    const secondJson = await readNubraJson(second);
+    if (!second.ok || !secondJson.temp_token) {
+      const err = new Error(secondJson?.error || secondJson?.message || `Nubra force OTP HTTP ${second.status}`);
+      err.statusCode = second.status;
+      err.payload = secondJson;
+      throw err;
+    }
+    return secondJson;
+  }
+
+  return firstJson;
+}
+
+async function handleNubraSendOtp(req) {
+  const body = await readJsonBody(req);
+  return sendNubraOtp(body.phone || process.env.NUBRA_PHONE || "");
+}
+
+async function verifyNubraOtpAndPin({ phone, otp, mpin, tempToken, deviceId }) {
+  const otpRes = await fetch(`${NUBRA_API}/verifyphoneotp`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-temp-token": tempToken,
+      "x-device-id": deviceId,
+    },
+    body: JSON.stringify({ phone, otp }),
+  });
+  const otpJson = await readNubraJson(otpRes);
+  const authToken = otpJson?.data?.auth_token || otpJson?.auth_token || "";
+  if ((otpRes.status !== 200 && otpRes.status !== 201) || !authToken) {
+    const err = new Error("OTP verification failed");
+    err.statusCode = otpRes.status;
+    err.payload = { step: "verifyphoneotp", detail: otpJson };
+    throw err;
+  }
+
+  const pinRes = await fetch(`${NUBRA_API}/verifypin`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      authorization: `Bearer ${authToken}`,
+      "x-device-id": deviceId,
+    },
+    body: JSON.stringify({ pin: mpin }),
+  });
+  const pinJson = await readNubraJson(pinRes);
+  const sessionToken = pinJson?.data?.session_token || pinJson?.session_token || pinJson?.data?.token || "";
+  if (!pinRes.ok || !sessionToken) {
+    const err = new Error("MPIN verification failed");
+    err.statusCode = pinRes.status;
+    err.payload = { step: "verifypin", detail: pinJson };
+    throw err;
+  }
+
+  return { authToken, sessionToken };
+}
+
+async function generateAndEnableNubraTotp({ sessionToken, mpin, deviceId }) {
+  await fetch(`${NUBRA_API}/totp/disable`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      authorization: `Bearer ${sessionToken}`,
+      "x-device-id": deviceId,
+    },
+    body: JSON.stringify({ mpin }),
+  }).catch(() => {});
+
+  const secretRes = await fetch(`${NUBRA_API}/totp/generate-secret`, {
+    method: "GET",
+    headers: {
+      "content-type": "application/json",
+      authorization: `Bearer ${sessionToken}`,
+      "x-device-id": deviceId,
+    },
+  });
+  const secretJson = await readNubraJson(secretRes);
+  const secretKey = secretJson?.data?.secret_key || secretJson?.secret_key || "";
+  if (!secretRes.ok || !secretKey) {
+    const err = new Error("Failed to generate TOTP secret");
+    err.statusCode = secretRes.status;
+    err.payload = { step: "totp/generate-secret", detail: secretJson };
+    throw err;
+  }
+
+  let lastJson = null;
+  let lastStatus = 502;
+  for (const offset of [0, -1, 1]) {
+    const enableRes = await fetch(`${NUBRA_API}/totp/enable`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${sessionToken}`,
+        "x-device-id": deviceId,
+      },
+      body: JSON.stringify({ mpin, totp: generateTOTP(secretKey, offset) }),
+    });
+    lastJson = await readNubraJson(enableRes);
+    lastStatus = enableRes.status;
+    if (enableRes.ok) return secretKey;
+  }
+
+  const err = new Error("Failed to enable TOTP");
+  err.statusCode = lastStatus;
+  err.payload = { step: "totp/enable", detail: lastJson };
+  throw err;
+}
+
+async function handleNubraSetupTotp(req) {
+  const body = await readJsonBody(req);
+  const phone = body.phone || process.env.NUBRA_PHONE || "";
+  const otp = body.otp || "";
+  const mpin = body.mpin || process.env.NUBRA_MPIN || "";
+  const tempToken = body.temp_token || body.tempToken || "";
+  if (!phone || !otp || !mpin || !tempToken) throw new Error("phone, otp, mpin, and temp_token are required");
+
+  const deviceId = getNubraDeviceId();
+  const { authToken, sessionToken } = await verifyNubraOtpAndPin({ phone, otp, mpin, tempToken, deviceId });
+  const secretKey = await generateAndEnableNubraTotp({ sessionToken, mpin, deviceId });
+  return {
+    secret_key: secretKey,
+    session_token: sessionToken,
+    auth_token: authToken,
+    device_id: deviceId,
+    raw_cookie: nubraCookie(authToken, sessionToken, deviceId),
+  };
+}
+
+async function handleNubraLogin(req) {
+  const body = await readJsonBody(req);
+  const phone = body.phone || process.env.NUBRA_PHONE || "";
+  const mpin = body.mpin || process.env.NUBRA_MPIN || "";
+  const totpSecret = body.totp_secret || body.totpSecret || process.env.NUBRA_TOTP_SECRET || "";
+  if (!phone || !mpin || !totpSecret) throw new Error("phone, mpin, and totp_secret are required");
+
+  const deviceId = getNubraDeviceId();
+  let lastJson = null;
+  let lastStatus = 502;
+  let authToken = "";
+
+  for (const offset of [0, -1, 1]) {
+    const loginRes = await fetch(`${NUBRA_API}/totp/login`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-device-id": deviceId,
+        "x-device-origin": "DESKTOP",
+      },
+      body: JSON.stringify({ phone, totp: parseInt(generateTOTP(totpSecret, offset), 10) }),
+    });
+    const loginJson = await readNubraJson(loginRes);
+    lastJson = loginJson;
+    lastStatus = loginRes.status;
+    authToken = loginJson?.auth_token || loginJson?.data?.auth_token || "";
+    if ((loginRes.status === 200 || loginRes.status === 201) && authToken) break;
+  }
+
+  const serialized = JSON.stringify(lastJson || {}).toLowerCase();
+  if (!authToken && serialized.includes("not enabled")) {
+    const otpData = await sendNubraOtp(phone).catch(() => null);
+    const err = new Error("totp_not_enabled");
+    err.statusCode = 202;
+    err.payload = {
+      error: "totp_not_enabled",
+      temp_token: otpData?.temp_token || "",
+      message: "TOTP is not enabled. OTP has been requested; verify OTP to re-enable it.",
+    };
+    throw err;
+  }
+
+  if (!authToken) {
+    const err = new Error("TOTP login failed");
+    err.statusCode = lastStatus;
+    err.payload = { error: "TOTP login failed", detail: lastJson };
+    throw err;
+  }
+
+  const pinRes = await fetch(`${NUBRA_API}/verifypin`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      authorization: `Bearer ${authToken}`,
+      "x-device-id": deviceId,
+      "x-device-origin": "DESKTOP",
+    },
+    body: JSON.stringify({ pin: mpin }),
+  });
+  const pinJson = await readNubraJson(pinRes);
+  const sessionToken = pinJson?.session_token || pinJson?.data?.session_token || pinJson?.data?.token || "";
+  if (!pinRes.ok || !sessionToken) {
+    const err = new Error("MPIN verification failed");
+    err.statusCode = pinRes.status;
+    err.payload = { error: "MPIN verification failed", detail: pinJson };
+    throw err;
+  }
+
+  return {
+    session_token: sessionToken,
+    auth_token: authToken,
+    device_id: deviceId,
+    raw_cookie: nubraCookie(authToken, sessionToken, deviceId),
+    userId: pinJson?.userId || pinJson?.data?.userId,
+    email: pinJson?.email || pinJson?.data?.email,
+    phone: pinJson?.phone || pinJson?.data?.phone,
+  };
+}
+
+async function handleNubraOtpReenableTotp(req) {
+  const body = await readJsonBody(req);
+  const phone = body.phone || process.env.NUBRA_PHONE || "";
+  const otp = body.otp || "";
+  const mpin = body.mpin || process.env.NUBRA_MPIN || "";
+  const tempToken = body.temp_token || body.tempToken || "";
+  if (!phone || !otp || !mpin || !tempToken) throw new Error("phone, otp, mpin, and temp_token are required");
+
+  const deviceId = getNubraDeviceId();
+  const { authToken, sessionToken } = await verifyNubraOtpAndPin({ phone, otp, mpin, tempToken, deviceId });
+  const secretKey = await generateAndEnableNubraTotp({ sessionToken, mpin, deviceId });
+  return {
+    session_token: sessionToken,
+    auth_token: authToken,
+    secret_key: secretKey,
+    device_id: deviceId,
+    raw_cookie: nubraCookie(authToken, sessionToken, deviceId),
+  };
 }
 
 // Rehydrate lastGoodCache from disk on startup
@@ -1361,6 +1837,10 @@ const server = http.createServer(async (req, res) => {
       const data = await handleUpstoxOptionChain(params, req.headers["x-upstox-access-token"]);
       res.writeHead(200);
       res.end(JSON.stringify(data));
+    } else if (url.pathname === "/api/upstox-public-candles") {
+      const data = await handleUpstoxPublicCandles(params);
+      res.writeHead(200);
+      res.end(JSON.stringify(data));
     } else if (url.pathname === "/api/upstox-feed-authorize") {
       const data = await handleUpstoxFeedAuthorize(req.headers["x-upstox-access-token"]);
       res.writeHead(200);
@@ -1371,6 +1851,22 @@ const server = http.createServer(async (req, res) => {
       res.end(JSON.stringify(data));
     } else if (url.pathname === "/api/nubra-timeseries") {
       const data = await handleNubraTimeseries(req);
+      res.writeHead(200);
+      res.end(JSON.stringify(data));
+    } else if (url.pathname === "/api/nubra-send-otp") {
+      const data = await handleNubraSendOtp(req);
+      res.writeHead(200);
+      res.end(JSON.stringify(data));
+    } else if (url.pathname === "/api/nubra-setup-totp") {
+      const data = await handleNubraSetupTotp(req);
+      res.writeHead(200);
+      res.end(JSON.stringify(data));
+    } else if (url.pathname === "/api/nubra-login") {
+      const data = await handleNubraLogin(req);
+      res.writeHead(200);
+      res.end(JSON.stringify(data));
+    } else if (url.pathname === "/api/nubra-otp-reenable-totp") {
+      const data = await handleNubraOtpReenableTotp(req);
       res.writeHead(200);
       res.end(JSON.stringify(data));
     } else if (url.pathname === "/api/dhan-proxy") {
@@ -1435,8 +1931,8 @@ const server = http.createServer(async (req, res) => {
     }
   } catch (err) {
     console.error(`[Proxy Error] ${url.pathname}:`, err.message);
-    res.writeHead(500);
-    res.end(JSON.stringify({ error: err.message }));
+    res.writeHead(err.statusCode || 500);
+    res.end(JSON.stringify(err.payload || { error: err.message }));
   }
 });
 

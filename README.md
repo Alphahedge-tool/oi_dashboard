@@ -1,4 +1,4 @@
-<img src="https://capsule-render.vercel.app/api?type=waving&color=0:071018,50:0f8c95,100:101827&height=180&section=header&text=Mr.%20Chartist%20Terminal&fontSize=46&fontColor=ffffff&animation=fadeIn&fontAlignY=35&desc=India's%20Best%20Open-Source%20F%26O%20Analytics%20Terminal&descSize=16&descAlignY=55&descColor=22d3ee" width="100%" />
+<img src="https://capsule-render.vercel.app/api?type=waving&color=0:071018,50:0f8c95,100:101827&height=180&section=header&text=Trishakti%20Terminal&fontSize=46&fontColor=ffffff&animation=fadeIn&fontAlignY=35&desc=India's%20Best%20Open-Source%20F%26O%20Analytics%20Terminal&descSize=16&descAlignY=55&descColor=22d3ee" width="100%" />
 
 <div align="center">
 
@@ -6,14 +6,14 @@
 
 Built for NSE F&O traders who want a polished, institutional-style terminal -- free, open-source, and running in your browser.
 
-Built by [**Mr. Chartist**](https://github.com/MrChartist) | Part of the [Mr. Chartist Ecosystem](https://mrchartist.com)
+Built by [**Trishakti**](https://github.com/trishakti) | Part of the Trishakti trading stack
 
 [![React](https://img.shields.io/badge/React-18.3-61dafb?logo=react&logoColor=white)](https://react.dev)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.8-3178c6?logo=typescript&logoColor=white)](https://typescriptlang.org)
 [![Vite](https://img.shields.io/badge/Vite-5.4-646cff?logo=vite&logoColor=white)](https://vitejs.dev)
 [![Tailwind CSS](https://img.shields.io/badge/Tailwind-3.4-06b6d4?logo=tailwindcss&logoColor=white)](https://tailwindcss.com)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
-[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-8b5cf6.svg)](https://github.com/MrChartist/india-s-best-option-hub/pulls)
+[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-8b5cf6.svg)](https://github.com/trishakti/options-terminal/pulls)
 
 [Preview](#preview) · [Simple Setup](#start-here-no-coding-experience-needed) · [Features](#-what-you-get) · [Quick Start](#-quick-start-5-minutes) · [Data Sources](#-data-sources) · [Contributing](#-contributing)
 
@@ -50,7 +50,7 @@ Built by [**Mr. Chartist**](https://github.com/MrChartist) | Part of the [Mr. Ch
 <details>
 <summary><strong>Polished Compact Navigation</strong></summary>
 
-![Mr. Chartist compact navigation rail](docs/screenshots/dashboard-collapsed-navbar.png)
+![Trishakti compact navigation rail](docs/screenshots/dashboard-collapsed-navbar.png)
 
 </details>
 
@@ -183,13 +183,13 @@ The dashboard is packed with live data widgets:
 Open your terminal (Command Prompt, PowerShell, or Terminal on Mac/Linux) and run:
 
 ```bash
-git clone https://github.com/MrChartist/india-s-best-option-hub.git
+git clone https://github.com/trishakti/options-terminal.git
 cd india-s-best-option-hub
 ```
 
 **Option B: Download ZIP (no Git needed)**
 
-1. Go to [github.com/MrChartist/india-s-best-option-hub](https://github.com/MrChartist/india-s-best-option-hub)
+1. Go to [github.com/trishakti/options-terminal](https://github.com/trishakti/options-terminal)
 2. Click the green **"Code"** button → **"Download ZIP"**
 3. Extract the ZIP file to any folder
 4. Open a terminal in that folder
@@ -674,7 +674,7 @@ If you're new to web development or this codebase, here's how to navigate:
 
 ### Architecture Overview
 
-![How Mr. Chartist Terminal Works](docs/screenshots/architecture-white-mrchartist.png)
+![How Trishakti Terminal Works](docs/screenshots/architecture-white-trishakti.png)
 
 The terminal is intentionally local-first: the React app runs at `http://localhost:4001`, the local proxy runs at `http://localhost:4002`, and your broker credentials stay on your own machine.
 
@@ -702,16 +702,16 @@ You are free to use, copy, modify, merge, publish, distribute, sublicense, and/o
 
 <div align="center">
 
-**Built with care by [Mr. Chartist](https://github.com/MrChartist) for the Indian Options Trading Community**
+**Built with care by [Trishakti](https://github.com/trishakti) for the Indian Options Trading Community**
 
 *If this project helps your trading, consider giving it a star on GitHub!*
 
-*Found a bug? Have an idea? [Open an issue](https://github.com/MrChartist/india-s-best-option-hub/issues) or submit a PR!*
+*Found a bug? Have an idea? [Open an issue](https://github.com/trishakti/options-terminal/issues) or submit a PR!*
 
 <br/>
 
-<a href="https://mrchartist.com"><img src="https://img.shields.io/badge/mrchartist.com-6366f1?style=flat-square&logo=safari&logoColor=white" alt="Website"/></a>
-<a href="https://github.com/MrChartist"><img src="https://img.shields.io/badge/More_Projects-0d1117?style=flat-square&logo=github&logoColor=white" alt="GitHub"/></a>
+<a href="https://github.com/trishakti"><img src="https://img.shields.io/badge/Trishakti-6366f1?style=flat-square&logo=safari&logoColor=white" alt="Website"/></a>
+<a href="https://github.com/trishakti"><img src="https://img.shields.io/badge/More_Projects-0d1117?style=flat-square&logo=github&logoColor=white" alt="GitHub"/></a>
 
 </div>
 

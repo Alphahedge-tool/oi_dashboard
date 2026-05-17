@@ -20,6 +20,7 @@ import { Plus, Trash2, DollarSign, Shield, Clock, Activity, BarChart3, Download,
 import { ComposedChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, ReferenceLine, Area, AreaChart, Bar } from "recharts";
 import { WhatIfSimulator } from "@/components/WhatIfSimulator";
 import { useToast } from "@/hooks/use-toast";
+import { useUpstoxSymbols } from "@/hooks/useMarketData";
 
 // Available symbols: indices + all F&O stocks
 const AVAILABLE_SYMBOLS = [
@@ -70,6 +71,7 @@ function EditableCell({ value, onSave, prefix = "", suffix = "", className = "" 
 
 export default function PositionTracker() {
   const { toast } = useToast();
+  const { data: upstoxSymbols = [] } = useUpstoxSymbols("", 500);
   const [positions, setPositions] = useState<Position[]>(() => getPositions());
   const [closedPositions, setClosedPositions] = useState<ClosedPosition[]>(() => getClosedPositions());
   const [showAddForm, setShowAddForm] = useState(false);
@@ -89,6 +91,10 @@ export default function PositionTracker() {
   const [formEntry, setFormEntry] = useState("100");
   const [formCmp, setFormCmp] = useState("100");
   const [formExpiry, setFormExpiry] = useState("");
+  const availableSymbols = useMemo(() => {
+    const apiSymbols = upstoxSymbols.map((s) => s.tradingSymbol || s.symbol).filter(Boolean);
+    return Array.from(new Set([...apiSymbols, ...AVAILABLE_SYMBOLS])).sort();
+  }, [upstoxSymbols]);
 
   // Update defaults when symbol changes
   useEffect(() => {
@@ -317,7 +323,7 @@ export default function PositionTracker() {
                 <Select value={formSymbol} onValueChange={setFormSymbol}>
                   <SelectTrigger className="h-7 text-xs"><SelectValue /></SelectTrigger>
                   <SelectContent className="max-h-[200px]">
-                    {AVAILABLE_SYMBOLS.map(s => (
+                    {availableSymbols.map(s => (
                       <SelectItem key={s} value={s} className="text-xs">{s}</SelectItem>
                     ))}
                   </SelectContent>

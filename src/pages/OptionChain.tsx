@@ -9,15 +9,16 @@ import { Input } from "@/components/ui/input";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import { ContextMenu, ContextMenuContent, ContextMenuItem, ContextMenuSeparator, ContextMenuTrigger, ContextMenuSub, ContextMenuSubContent, ContextMenuSubTrigger } from "@/components/ui/context-menu";
 import { ScrollArea, ScrollBar } from "@/components/ui/scroll-area";
-import { Crosshair, Wifi, WifiOff, RefreshCw, Bell, TrendingUp, TrendingDown, Layers, ChevronLeft, ChevronRight, Settings2, Flame, Search, X, Download, BarChart3, ChevronDown, ChevronUp, History, Keyboard } from "lucide-react";
+import { Crosshair, Wifi, WifiOff, RefreshCw, Bell, TrendingUp, TrendingDown, Layers, ChevronLeft, ChevronRight, Settings2, Flame, Search, X, Download, BarChart3, ChevronDown, ChevronUp, History, Keyboard, Loader2 } from "lucide-react";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Switch } from "@/components/ui/switch";
 import { Label } from "@/components/ui/label";
-import { useLiveOptionChain } from "@/hooks/useMarketData";
+import { useLiveOptionChain, useUpstoxSymbols } from "@/hooks/useMarketData";
 import { useUpstoxLiveOptionChain } from "@/hooks/useUpstoxLiveOptionChain";
 import { StockChart } from "@/components/StockChart";
 import { toast } from "sonner";
+import { createChart, ColorType, LineSeries, type IChartApi, type Time } from "lightweight-charts";
 
 // ── Symbol categories for organized browsing ──
 const SYMBOL_CATEGORIES: { label: string; symbols: { label: string; value: string }[] }[] = [
@@ -125,14 +126,107 @@ const SYMBOL_CATEGORIES: { label: string; symbols: { label: string; value: strin
 
 // Flat list for search
 const ALL_SYMBOLS = SYMBOL_CATEGORIES.flatMap(cat => cat.symbols);
+const PROXY_BASE = import.meta.env.VITE_PROXY_URL || "http://localhost:4002";
+
+type Candle = { time: number; open: number; high: number; low: number; close: number; volume: number };
+type DiffPoint = { time: number; value: number };
+
+function normalizeCandle(row: any): Candle | null {
+  if (!Array.isArray(row) || row.length < 5) return null;
+  const parsed = typeof row[0] === "number" ? row[0] : Date.parse(row[0]);
+  if (!Number.isFinite(parsed)) return null;
+  return {
+    time: parsed > 10_000_000_000 ? Math.floor(parsed / 1000) : Math.floor(parsed),
+    open: Number(row[1]),
+    high: Number(row[2]),
+    low: Number(row[3]),
+    close: Number(row[4]),
+    volume: Number(row[5] || 0),
+  };
+}
+
+function candleAtOrBefore(candles: Candle[], time: number) {
+  let lo = 0;
+  let hi = candles.length - 1;
+  let best: Candle | null = null;
+  while (lo <= hi) {
+    const mid = Math.floor((lo + hi) / 2);
+    if (candles[mid].time <= time) {
+      best = candles[mid];
+      lo = mid + 1;
+    } else {
+      hi = mid - 1;
+    }
+  }
+  return best;
+}
+
+async function fetchOptionCandlePage(instrumentKey: string, from: number): Promise<{ candles: Candle[]; prev: number | null }> {
+  const params = new URLSearchParams({
+    instrumentKey,
+    interval: "I1",
+    from: String(from),
+    limit: "500",
+  });
+  const res = await fetch(`${PROXY_BASE}/api/upstox-public-candles?${params.toString()}`, {
+    signal: AbortSignal.timeout(16000),
+  });
+  if (!res.ok) throw new Error(`Candles HTTP ${res.status}`);
+  const json = await res.json();
+  const seen = new Set<number>();
+  const candles = (json?.data?.candles || json?.candles || [])
+    .map(normalizeCandle)
+    .filter((c): c is Candle => !!c && Number.isFinite(c.close))
+    .sort((a, b) => a.time - b.time)
+    .filter((c) => {
+      if (seen.has(c.time)) return false;
+      seen.add(c.time);
+      return true;
+    });
+  return { candles, prev: json?.data?.meta?.prevTimestamp || null };
+}
+
+async function fetchOptionDayCandles(instrumentKey: string): Promise<Candle[]> {
+  const first = await fetchOptionCandlePage(instrumentKey, new Date().setHours(23, 59, 59, 999));
+  if (first.candles.length || !first.prev) return first.candles;
+  const fallback = await fetchOptionCandlePage(instrumentKey, Number(first.prev));
+  return fallback.candles;
+}
+
+function buildCePeDiffSeries(ceCandles: Candle[], peCandles: Candle[]): DiffPoint[] {
+  const times = Array.from(new Set([...ceCandles.map((c) => c.time), ...peCandles.map((c) => c.time)])).sort((a, b) => a - b);
+  return times
+    .map((time) => {
+      const ce = candleAtOrBefore(ceCandles, time);
+      const pe = candleAtOrBefore(peCandles, time);
+      if (!ce || !pe) return null;
+      return { time, value: ce.close - pe.close };
+    })
+    .filter((point): point is DiffPoint => !!point && Number.isFinite(point.value));
+}
 
 // ── Searchable Symbol Selector Component ──
 function SymbolSearch({ value, onSelect }: { value: string; onSelect: (v: string) => void }) {
   const [open, setOpen] = useState(false);
   const [search, setSearch] = useState("");
   const inputRef = useRef<HTMLInputElement>(null);
+  const { data: apiSymbols = [] } = useUpstoxSymbols(search, 120);
 
   const filtered = useMemo(() => {
+    if (apiSymbols.length > 0) {
+      const symbols = apiSymbols
+        .map((s) => ({
+          label: s.name && s.name !== s.tradingSymbol ? `${s.tradingSymbol} · ${s.name}` : s.tradingSymbol,
+          value: s.tradingSymbol || s.symbol,
+          exchange: s.exchange,
+          type: s.instrumentType,
+        }))
+        .filter((s) => s.value);
+      return [{
+        label: search ? "Upstox instruments" : "Upstox underlyings",
+        symbols,
+      }];
+    }
     if (!search) return SYMBOL_CATEGORIES;
     const q = search.toUpperCase();
     return SYMBOL_CATEGORIES
@@ -143,7 +237,7 @@ function SymbolSearch({ value, onSelect }: { value: string; onSelect: (v: string
         ),
       }))
       .filter(cat => cat.symbols.length > 0);
-  }, [search]);
+  }, [apiSymbols, search]);
 
   const currentLabel = ALL_SYMBOLS.find(s => s.value === value)?.label || value;
 
@@ -272,6 +366,11 @@ const fmtSigned = (value: number) => {
   return `${value >= 0 ? "+" : ""}${Math.round(value).toLocaleString("en-IN")}`;
 };
 
+const fmtSignedPrice = (value: number) => {
+  if (!Number.isFinite(value)) return "-";
+  return `${value >= 0 ? "+" : ""}${fmtNum(value, 2)}`;
+};
+
 function TerminalOiCell({
   value,
   previous,
@@ -286,20 +385,166 @@ function TerminalOiCell({
   const todayPct = Math.min((Math.abs(value) / Math.max(max, 1)) * 100, 100);
   const prevPct = Math.min((Math.abs(previous) / Math.max(max, 1)) * 100, 100);
   const changePct = previous ? ((value - previous) / Math.abs(previous)) * 100 : 0;
+  const isRising = changePct >= 0;
   return (
-    <div className={`min-w-[96px] ${align === "right" ? "text-right" : "text-left"}`}>
-      <div className="text-[12px] leading-4 text-emerald-700 dark:text-emerald-400">{fmtCompactIN(value)}</div>
-      <div className={`relative mt-0.5 h-[7px] w-full ${align === "right" ? "ml-auto" : "mr-auto"}`}>
+    <div className={`min-w-[122px] ${align === "right" ? "text-right" : "text-left"}`}>
+      <div className={`text-[12px] font-semibold leading-4 ${isRising ? "text-emerald-700 dark:text-[#4fe0a0]" : "text-rose-600 dark:text-[#ff746f]"}`}>
+        {fmtCompactIN(value)}
+      </div>
+      <div className={`relative mt-1 h-[15px] w-full overflow-hidden rounded-sm bg-slate-200/70 shadow-inner dark:bg-[#0b0810] ${align === "right" ? "ml-auto" : "mr-auto"}`}>
         <div
-          className={`absolute top-0 h-[3px] bg-amber-500 dark:bg-[#f1c46b] ${align === "right" ? "right-0" : "left-0"}`}
+          className={`absolute top-[1px] h-[6px] rounded-sm bg-amber-500 shadow-[0_0_10px_rgba(245,158,11,0.28)] dark:bg-[#f4c669] dark:shadow-[0_0_12px_rgba(244,198,105,0.32)] ${align === "right" ? "right-0" : "left-0"}`}
           style={{ width: `${todayPct}%` }}
         />
         <div
-          className={`absolute bottom-0 h-[3px] bg-amber-700 dark:bg-[#b78a43] ${align === "right" ? "right-0" : "left-0"}`}
+          className={`absolute bottom-[1px] h-[5px] rounded-sm bg-amber-800/90 dark:bg-[#9c743b] ${align === "right" ? "right-0" : "left-0"}`}
           style={{ width: `${prevPct}%` }}
         />
       </div>
-      <div className="text-[10px] leading-3 text-slate-700 dark:text-slate-100">{changePct >= 0 ? "+" : ""}{changePct.toFixed(2)} %</div>
+      <div className={`text-[10px] font-semibold leading-3 ${isRising ? "text-emerald-700 dark:text-[#d8fff0]" : "text-rose-600 dark:text-[#ffd0cd]"}`}>
+        {changePct >= 0 ? "+" : ""}{changePct.toFixed(2)} %
+      </div>
+    </div>
+  );
+}
+
+function CePeDifferenceChart({
+  symbol,
+  strike,
+  ceKey,
+  peKey,
+  onClose,
+}: {
+  symbol: string;
+  strike: number;
+  ceKey: string;
+  peKey: string;
+  onClose: () => void;
+}) {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const chartRef = useRef<IChartApi | null>(null);
+  const [points, setPoints] = useState<DiffPoint[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    setError("");
+    setPoints([]);
+
+    Promise.all([fetchOptionDayCandles(ceKey), fetchOptionDayCandles(peKey)])
+      .then(([ceCandles, peCandles]) => {
+        if (cancelled) return;
+        const nextPoints = buildCePeDiffSeries(ceCandles, peCandles);
+        setPoints(nextPoints);
+        if (!nextPoints.length) setError("No matching CE/PE candle points found for this strike.");
+      })
+      .catch((err) => {
+        if (!cancelled) setError(err instanceof Error ? err.message : String(err));
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [ceKey, peKey]);
+
+  useEffect(() => {
+    if (!containerRef.current || !points.length) return;
+    chartRef.current?.remove();
+    chartRef.current = null;
+
+    const container = containerRef.current;
+    const isDark = document.documentElement.classList.contains("dark");
+    const last = points[points.length - 1]?.value ?? 0;
+    const first = points[0]?.value ?? 0;
+    const lineColor = last >= first ? (isDark ? "#4fe0a0" : "#0f9f6e") : (isDark ? "#ff9a62" : "#ea580c");
+
+    const chart = createChart(container, {
+      width: container.clientWidth,
+      height: 260,
+      layout: {
+        background: { type: ColorType.Solid, color: isDark ? "#0f171a" : "#ffffff" },
+        textColor: isDark ? "#92a4aa" : "#64748b",
+        fontFamily: "'JetBrains Mono', 'Inter', system-ui, sans-serif",
+        fontSize: 11,
+      },
+      grid: {
+        vertLines: { color: isDark ? "rgba(127,127,127,0.12)" : "rgba(15,23,42,0.08)" },
+        horzLines: { color: isDark ? "rgba(127,127,127,0.12)" : "rgba(15,23,42,0.08)" },
+      },
+      rightPriceScale: { borderVisible: false },
+      timeScale: {
+        borderVisible: false,
+        timeVisible: true,
+        secondsVisible: false,
+        rightOffset: 4,
+      },
+      localization: {
+        locale: "en-IN",
+        priceFormatter: (value: number) => fmtSignedPrice(value),
+      },
+      handleScroll: { mouseWheel: true, pressedMouseMove: true },
+      handleScale: { mouseWheel: true, pinch: true },
+    });
+    chartRef.current = chart;
+
+    const series = chart.addSeries(LineSeries, {
+      color: lineColor,
+      lineWidth: 2,
+      crosshairMarkerVisible: true,
+      crosshairMarkerRadius: 4,
+    });
+    series.setData(points.map((point) => ({ time: point.time as Time, value: point.value })));
+    chart.timeScale().fitContent();
+
+    const resizeObserver = new ResizeObserver(([entry]) => {
+      chart.applyOptions({ width: entry.contentRect.width });
+    });
+    resizeObserver.observe(container);
+
+    return () => {
+      resizeObserver.disconnect();
+      chart.remove();
+      chartRef.current = null;
+    };
+  }, [points]);
+
+  const latest = points[points.length - 1]?.value;
+
+  return (
+    <div className="border-b border-slate-200 bg-slate-50 p-2 dark:border-[#223036] dark:bg-[#0d1417]">
+      <div className="rounded border border-slate-200 bg-white p-2 shadow-sm dark:border-[#223036] dark:bg-[#0f171a]">
+        <div className="mb-2 flex items-center justify-between gap-2">
+          <div className="min-w-0">
+            <div className="text-xs font-semibold text-slate-900 dark:text-white">
+              {symbol} {strike.toLocaleString("en-IN")} CE-PE intraday
+            </div>
+            <div className="text-[11px] text-slate-500 dark:text-[#92a4aa]">
+              1-minute Upstox option candles
+            </div>
+          </div>
+          <div className="flex items-center gap-2">
+            {latest !== undefined && (
+              <Badge variant="outline" className={`font-mono text-[11px] ${latest >= 0 ? "text-emerald-700 dark:text-[#4fe0a0]" : "text-orange-600 dark:text-[#ff9a62]"}`}>
+                {fmtSignedPrice(latest)}
+              </Badge>
+            )}
+            {loading && <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />}
+            <Button variant="ghost" size="icon" className="h-7 w-7" onClick={onClose}>
+              <X className="h-3.5 w-3.5" />
+            </Button>
+          </div>
+        </div>
+        {error ? (
+          <div className="flex h-[260px] items-center justify-center text-sm text-slate-500 dark:text-slate-300">{error}</div>
+        ) : (
+          <div ref={containerRef} className="h-[260px] w-full overflow-hidden rounded bg-white dark:bg-[#0f171a]" />
+        )}
+      </div>
     </div>
   );
 }
@@ -321,6 +566,11 @@ export default function OptionChain() {
   const [showChart, setShowChart] = useState(false);
   const [isDownloadingPast, setIsDownloadingPast] = useState(false);
   const [focusedStrikeIdx, setFocusedStrikeIdx] = useState<number>(-1);
+  const [selectedDiffChart, setSelectedDiffChart] = useState<{
+    strike: number;
+    ceKey: string;
+    peKey: string;
+  } | null>(null);
 
   const quickTrade = useCallback((strike: number, type: "CE" | "PE", action: "BUY" | "SELL") => {
     navigate(`/strategy?${new URLSearchParams({ symbol, strike: String(strike), type, action })}`);
@@ -396,6 +646,16 @@ export default function OptionChain() {
       case "alert": toast.success(`Alert set for ${symbol} ${strike} ${type}`); break;
       case "oi-analysis": navigate(`/oi-analysis`); break;
     }
+  };
+
+  const openDiffChart = (row: any) => {
+    const ceKey = row.ce?.instrumentKey || "";
+    const peKey = row.pe?.instrumentKey || "";
+    if (!ceKey || !peKey) {
+      toast.error("This strike does not have Upstox CE/PE instrument keys for charting.");
+      return;
+    }
+    setSelectedDiffChart({ strike: row.strikePrice, ceKey, peKey });
   };
 
   // Compute intrinsic + time values
@@ -591,39 +851,44 @@ export default function OptionChain() {
   const visibleExpiry = selectedExpiry || expiries[0]?.value;
 
   return (
-    <div className="-m-3 h-[calc(100vh-78px)] min-h-[720px] overflow-hidden bg-white text-slate-900 shadow-sm dark:bg-[#19151f] dark:text-white lg:-m-4">
+    <div className="-m-3 h-[calc(100vh-78px)] min-h-[720px] overflow-hidden bg-white text-slate-900 shadow-sm dark:bg-[#0b1114] dark:text-white lg:-m-4">
       <div className="flex h-full min-h-0 flex-col">
-        <div className="flex h-11 items-center justify-between border-b border-slate-200 px-3 dark:border-[#3b3344]">
+        <div className="flex h-11 items-center justify-between border-b border-slate-200 bg-white px-3 dark:border-[#223036] dark:bg-[#0f171a]">
           <div className="flex items-center gap-2">
             <Search className="h-4 w-4 text-slate-900 dark:text-white" />
             <div className="leading-tight">
-              <div className="text-[11px] text-slate-500 dark:text-[#9b8ab0]">Option Chain for</div>
-              <button
-                className="text-[13px] font-semibold text-slate-900 dark:text-white"
-                onClick={() => setSymbol(symbol === "NIFTY" ? "BANKNIFTY" : "NIFTY")}
-              >
-                {symbol}
-              </button>
+              <div className="text-[11px] text-slate-500 dark:text-[#92a4aa]">Option Chain for</div>
+              <div className="mt-0.5">
+                <SymbolSearch value={symbol} onSelect={(v) => { setSymbol(v); setSelectedExpiry(undefined); }} />
+              </div>
             </div>
           </div>
           <div className="flex items-center gap-4 text-[12px]">
-            <button onClick={() => refetch()} className="text-slate-800 hover:text-violet-700 dark:text-white dark:hover:text-violet-300">
+            <button onClick={() => refetch()} className="text-slate-800 hover:text-teal-700 dark:text-white dark:hover:text-[#42d3c7]">
               <RefreshCw className="h-4 w-4" />
             </button>
             <span>Max pain: <b>{maxPain.toLocaleString("en-IN", { minimumFractionDigits: 2 })}</b></span>
             <span>India VIX <span className="text-red-600">▼ 18.48</span></span>
             <Button variant="outline" className="h-7 rounded px-2 text-xs" onClick={() => navigate("/oi-analysis")}>OI ↗</Button>
+            <Button
+              variant="outline"
+              className={`h-7 rounded px-2 text-xs ${showChart ? "border-teal-500/60 bg-teal-500/10 text-teal-700 dark:text-[#42d3c7]" : ""}`}
+              onClick={() => setShowChart(v => !v)}
+            >
+              <BarChart3 className="mr-1 h-3.5 w-3.5" />
+              Chart
+            </Button>
             <Settings2 className="h-4 w-4" />
           </div>
         </div>
 
-        <div className="flex h-10 items-center gap-2 overflow-x-auto border-b border-slate-200 px-3 text-[12px] dark:border-[#3b3344]">
-          <button className="mr-2 flex items-center gap-1 font-semibold text-violet-800 dark:text-violet-300">All <ChevronUp className="h-3 w-3" /></button>
+        <div className="flex h-10 items-center gap-2 overflow-x-auto border-b border-slate-200 bg-slate-50 px-3 text-[12px] dark:border-[#223036] dark:bg-[#0d1417]">
+          <button className="mr-2 flex items-center gap-1 font-semibold text-teal-800 dark:text-[#42d3c7]">All <ChevronUp className="h-3 w-3" /></button>
           {expiries.map((exp) => (
             <button
               key={exp.value}
               onClick={() => setSelectedExpiry(exp.value)}
-              className={`h-6 shrink-0 rounded border px-3 ${visibleExpiry === exp.value ? "border-violet-600 bg-violet-50 text-violet-800 dark:border-violet-500 dark:bg-[#231934] dark:text-violet-200" : "border-slate-300 bg-white text-slate-700 hover:bg-slate-50 dark:border-[#5a5065] dark:bg-[#211b28] dark:text-slate-200 dark:hover:bg-[#2c2535]"}`}
+              className={`h-6 shrink-0 rounded border px-3 ${visibleExpiry === exp.value ? "border-teal-600 bg-teal-50 text-teal-900 dark:border-[#42d3c7] dark:bg-[#123432] dark:text-[#d8fffb]" : "border-slate-300 bg-white text-slate-700 hover:bg-slate-50 dark:border-[#314248] dark:bg-[#111c20] dark:text-slate-200 dark:hover:bg-[#17262b]"}`}
             >
               {exp.label.replace(/,/g, "")} {exp.daysToExpiry <= 14 && <span className="ml-1 rounded-sm border px-1 text-[10px]">W</span>}
             </button>
@@ -631,16 +896,34 @@ export default function OptionChain() {
           <ChevronRight className="ml-auto h-4 w-4 shrink-0 text-slate-700 dark:text-slate-200" />
         </div>
 
-        <div className="flex h-9 items-center justify-between border-b border-slate-200 px-4 text-[12px] font-semibold text-violet-900 dark:border-[#3b3344] dark:text-violet-300">
+        <div className="flex h-9 items-center justify-between border-b border-slate-200 bg-white px-4 text-[12px] font-semibold text-teal-900 dark:border-[#223036] dark:bg-[#0f171a] dark:text-[#42d3c7]">
           <div>« Calls</div>
           <div>Puts »</div>
         </div>
 
-        <div className="min-h-0 flex-1 overflow-auto bg-white dark:bg-[#19151f]">
+        {showChart && (
+          <div className="border-b border-slate-200 bg-slate-50 p-2 dark:border-[#223036] dark:bg-[#0d1417]">
+            <div className="h-[320px] overflow-hidden rounded border border-slate-200 bg-white p-2 shadow-sm dark:border-[#223036] dark:bg-[#0f171a]">
+              <StockChart symbol={symbol} inline height={304} />
+            </div>
+          </div>
+        )}
+
+        {selectedDiffChart && (
+          <CePeDifferenceChart
+            symbol={symbol}
+            strike={selectedDiffChart.strike}
+            ceKey={selectedDiffChart.ceKey}
+            peKey={selectedDiffChart.peKey}
+            onClose={() => setSelectedDiffChart(null)}
+          />
+        )}
+
+        <div className="min-h-0 flex-1 overflow-auto bg-white dark:bg-[#0b1114]">
           {isLoading ? (
             <div className="flex h-full min-h-[520px] items-center justify-center text-sm text-slate-500 dark:text-slate-300">Loading option chain...</div>
           ) : !enrichedChain.length ? (
-            <div className="flex h-full min-h-[520px] flex-col items-center justify-center gap-3 bg-white text-sm text-slate-500 dark:bg-[#19151f] dark:text-slate-300">
+            <div className="flex h-full min-h-[520px] flex-col items-center justify-center gap-3 bg-white text-sm text-slate-500 dark:bg-[#0b1114] dark:text-slate-300">
               <WifiOff className="h-8 w-8 text-slate-300 dark:text-slate-600" />
               <div className="font-semibold text-slate-800 dark:text-white">No option-chain rows loaded</div>
               <div className="max-w-md text-center text-xs">Check that the Upstox token is saved or the proxy is running, then refresh the chain.</div>
@@ -650,9 +933,9 @@ export default function OptionChain() {
               </Button>
             </div>
           ) : (
-            <table className="w-full min-w-[1500px] border-collapse text-[12px]">
-              <thead className="sticky top-0 z-20 bg-white dark:bg-[#19151f]">
-                <tr className="h-9 border-b border-slate-200 text-[12px] text-slate-600 dark:border-[#3b3344] dark:text-white">
+            <table className="w-full min-w-[1660px] border-collapse text-[12px]">
+              <thead className="sticky top-0 z-20 bg-white dark:bg-[#0f171a]">
+                <tr className="h-9 border-b border-slate-200 text-[12px] text-slate-600 shadow-sm dark:border-[#223036] dark:text-white">
                   <th className="px-3 text-left font-semibold">Volume</th>
                   <th className="px-3 text-right font-semibold">IV</th>
                   <th className="px-3 text-right font-semibold">Vega</th>
@@ -660,11 +943,12 @@ export default function OptionChain() {
                   <th className="px-3 text-right font-semibold">Theta</th>
                   <th className="px-3 text-right font-semibold">Delta</th>
                   <th className="px-3 text-right font-semibold">OI <span className="text-[10px]">(chg)</span></th>
-                  <th className="px-3 text-right font-semibold">OI <span className="text-[10px]">(lakhs)</span></th>
+                  <th className="min-w-[146px] px-3 text-right font-semibold">OI <span className="text-[10px]">(lakhs)</span></th>
                   <th className="px-3 text-right font-semibold">LTP</th>
-                  <th className="w-[92px] border-x border-slate-200 bg-slate-50 px-3 text-center font-semibold dark:border-[#3b3344] dark:bg-[#211b28]">Strike</th>
+                  <th className="w-[98px] border-l border-slate-200 bg-slate-50 px-3 text-center font-semibold dark:border-[#2d4248] dark:bg-[#132025]">Strike</th>
+                  <th className="w-[88px] border-r border-slate-200 bg-slate-50 px-3 text-center font-semibold dark:border-[#2d4248] dark:bg-[#132025]">CE-PE</th>
                   <th className="px-3 text-left font-semibold">LTP</th>
-                  <th className="px-3 text-left font-semibold">OI <span className="text-[10px]">(lakhs)</span></th>
+                  <th className="min-w-[146px] px-3 text-left font-semibold">OI <span className="text-[10px]">(lakhs)</span></th>
                   <th className="px-3 text-left font-semibold">OI <span className="text-[10px]">(chg)</span></th>
                   <th className="px-3 text-left font-semibold">Delta</th>
                   <th className="px-3 text-left font-semibold">Theta</th>
@@ -687,41 +971,53 @@ export default function OptionChain() {
                   return (
                     <Fragment key={row.strikePrice}>
                       {showSpot && (
-                        <tr className="h-6 border-y border-slate-200 bg-white text-center text-[11px] font-semibold dark:border-[#3b3344] dark:bg-[#19151f]">
+                        <tr className="h-6 border-y border-slate-200 bg-white text-center text-[11px] font-semibold dark:border-[#2d4248] dark:bg-[#0f171a]">
                           <td colSpan={9}></td>
-                          <td className="border-x border-slate-200 dark:border-[#3b3344]">Spot <span className="text-emerald-700 dark:text-emerald-400">▲ {fmtNum(spotPrice, 2)}</span></td>
+                          <td colSpan={2} className="border-x border-slate-200 dark:border-[#2d4248]">Spot <span className="text-emerald-700 dark:text-[#4fe0a0]">▲ {fmtNum(spotPrice, 2)}</span></td>
                           <td colSpan={9}></td>
                         </tr>
                       )}
-                      <tr key={row.strikePrice} className="h-[49px] border-b border-slate-200 hover:bg-violet-50/40 dark:border-[#3b3344] dark:hover:bg-violet-500/10">
-                        <td className={`px-3 text-left ${ceItm ? "bg-amber-50 dark:bg-[#2d2522]" : ""}`}>{fmtCompactIN(row.ce.volume)}</td>
-                        <td className={`px-3 text-right ${ceItm ? "bg-amber-50 dark:bg-[#2d2522]" : ""}`}>{fmtNum(row.ce.iv, 2)}</td>
-                        <td className={`px-3 text-right ${ceItm ? "bg-amber-50 dark:bg-[#2d2522]" : ""}`}>{fmtNum(row.ce.vega, 4)}</td>
-                        <td className={`px-3 text-right ${ceItm ? "bg-amber-50 dark:bg-[#2d2522]" : ""}`}>{fmtNum(row.ce.gamma, 4)}</td>
-                        <td className={`px-3 text-right ${ceItm ? "bg-amber-50 dark:bg-[#2d2522]" : ""}`}>{fmtNum(row.ce.theta, 4)}</td>
-                        <td className={`px-3 text-right ${ceItm ? "bg-amber-50 dark:bg-[#2d2522]" : ""}`}>{fmtNum(row.ce.delta, 4)}</td>
-                        <td className={`px-3 text-right ${ceItm ? "bg-amber-50 dark:bg-[#2d2522]" : ""}`}>{fmtSigned(ceOiChange)}</td>
-                        <td className={`px-3 ${ceItm ? "bg-amber-50 dark:bg-[#2d2522]" : ""}`}><TerminalOiCell value={row.ce.oi} previous={cePrev} max={terminalMaxOI} align="right" /></td>
-                        <td className={`px-3 text-right ${ceItm ? "bg-amber-50 dark:bg-[#2d2522]" : ""}`}>
-                          <button onClick={() => quickTrade(row.strikePrice, "CE", "BUY")} className="font-medium text-emerald-700 hover:underline dark:text-emerald-400">{fmtNum(row.ce.ltp, 2)}</button>
+                      <tr key={row.strikePrice} className="h-[54px] border-b border-slate-200 hover:bg-teal-50/50 dark:border-[#1f2c31] dark:hover:bg-[#132428]">
+                        <td className={`px-3 text-left ${ceItm ? "bg-amber-50 dark:bg-[#2b241d]" : ""}`}>{fmtCompactIN(row.ce.volume)}</td>
+                        <td className={`px-3 text-right ${ceItm ? "bg-amber-50 dark:bg-[#2b241d]" : ""}`}>{fmtNum(row.ce.iv, 2)}</td>
+                        <td className={`px-3 text-right ${ceItm ? "bg-amber-50 dark:bg-[#2b241d]" : ""}`}>{fmtNum(row.ce.vega, 4)}</td>
+                        <td className={`px-3 text-right ${ceItm ? "bg-amber-50 dark:bg-[#2b241d]" : ""}`}>{fmtNum(row.ce.gamma, 4)}</td>
+                        <td className={`px-3 text-right ${ceItm ? "bg-amber-50 dark:bg-[#2b241d]" : ""}`}>{fmtNum(row.ce.theta, 4)}</td>
+                        <td className={`px-3 text-right ${ceItm ? "bg-amber-50 dark:bg-[#2b241d]" : ""}`}>{fmtNum(row.ce.delta, 4)}</td>
+                        <td className={`px-3 text-right ${ceItm ? "bg-amber-50 dark:bg-[#2b241d]" : ""}`}>{fmtSigned(ceOiChange)}</td>
+                        <td className={`px-3 ${ceItm ? "bg-amber-50 dark:bg-[#2b241d]" : ""}`}><TerminalOiCell value={row.ce.oi} previous={cePrev} max={terminalMaxOI} align="right" /></td>
+                        <td className={`px-3 text-right ${ceItm ? "bg-amber-50 dark:bg-[#2b241d]" : ""}`}>
+                          <button onClick={() => quickTrade(row.strikePrice, "CE", "BUY")} className="font-semibold text-emerald-700 hover:underline dark:text-[#4fe0a0]">{fmtNum(row.ce.ltp, 2)}</button>
                           <div className="text-[10px] text-slate-700 dark:text-slate-100">+{Math.abs(row.ce.ltp / Math.max(row.strikePrice, 1) * 100).toFixed(2)} %</div>
                         </td>
-                        <td className="border-x border-slate-200 bg-slate-50 px-3 text-center dark:border-[#3b3344] dark:bg-[#211b28]">
+                        <td className="border-x border-slate-200 bg-slate-50 px-3 text-center dark:border-[#2d4248] dark:bg-[#132025]">
                           <div className="font-bold text-slate-900 dark:text-slate-200">{row.strikePrice.toLocaleString("en-IN")}</div>
                           <div className="text-[10px] text-slate-500 dark:text-slate-100">PCR: {pcrRow.toFixed(2)}</div>
                         </td>
-                        <td className={`px-3 text-left ${peItm ? "bg-amber-50 dark:bg-[#2d2522]" : ""}`}>
-                          <button onClick={() => quickTrade(row.strikePrice, "PE", "BUY")} className="font-medium text-orange-600 hover:underline dark:text-orange-400">{fmtNum(row.pe.ltp, 2)}</button>
+                        <td className={`border-r border-slate-200 bg-slate-50 px-1 text-center font-mono font-semibold dark:border-[#2d4248] dark:bg-[#132025] ${
+                          row.ce.ltp - row.pe.ltp >= 0 ? "text-emerald-700 dark:text-[#4fe0a0]" : "text-orange-600 dark:text-[#ff9a62]"
+                        }`}>
+                          <button
+                            type="button"
+                            onClick={() => openDiffChart(row)}
+                            className="w-full rounded px-2 py-1 text-center transition-colors hover:bg-teal-100/70 hover:underline dark:hover:bg-[#123432]"
+                            title="Show CE-PE intraday chart"
+                          >
+                            {fmtSignedPrice(row.ce.ltp - row.pe.ltp)}
+                          </button>
+                        </td>
+                        <td className={`px-3 text-left ${peItm ? "bg-amber-50 dark:bg-[#2b241d]" : ""}`}>
+                          <button onClick={() => quickTrade(row.strikePrice, "PE", "BUY")} className="font-semibold text-orange-600 hover:underline dark:text-[#ff9a62]">{fmtNum(row.pe.ltp, 2)}</button>
                           <div className="text-[10px] text-slate-700 dark:text-slate-100">-{Math.abs(row.pe.ltp / Math.max(row.strikePrice, 1) * 100).toFixed(2)} %</div>
                         </td>
-                        <td className={`px-3 ${peItm ? "bg-amber-50 dark:bg-[#2d2522]" : ""}`}><TerminalOiCell value={row.pe.oi} previous={pePrev} max={terminalMaxOI} align="left" /></td>
-                        <td className={`px-3 text-left ${peItm ? "bg-amber-50 dark:bg-[#2d2522]" : ""}`}>{fmtSigned(peOiChange)}</td>
-                        <td className={`px-3 text-left ${peItm ? "bg-amber-50 dark:bg-[#2d2522]" : ""}`}>{fmtNum(row.pe.delta, 4)}</td>
-                        <td className={`px-3 text-left ${peItm ? "bg-amber-50 dark:bg-[#2d2522]" : ""}`}>{fmtNum(row.pe.theta, 4)}</td>
-                        <td className={`px-3 text-left ${peItm ? "bg-amber-50 dark:bg-[#2d2522]" : ""}`}>{fmtNum(row.pe.gamma, 4)}</td>
-                        <td className={`px-3 text-left ${peItm ? "bg-amber-50 dark:bg-[#2d2522]" : ""}`}>{fmtNum(row.pe.vega, 4)}</td>
-                        <td className={`px-3 text-left ${peItm ? "bg-amber-50 dark:bg-[#2d2522]" : ""}`}>{fmtNum(row.pe.iv, 2)}</td>
-                        <td className={`px-3 text-left ${peItm ? "bg-amber-50 dark:bg-[#2d2522]" : ""}`}>{fmtCompactIN(row.pe.volume)}</td>
+                        <td className={`px-3 ${peItm ? "bg-amber-50 dark:bg-[#2b241d]" : ""}`}><TerminalOiCell value={row.pe.oi} previous={pePrev} max={terminalMaxOI} align="left" /></td>
+                        <td className={`px-3 text-left ${peItm ? "bg-amber-50 dark:bg-[#2b241d]" : ""}`}>{fmtSigned(peOiChange)}</td>
+                        <td className={`px-3 text-left ${peItm ? "bg-amber-50 dark:bg-[#2b241d]" : ""}`}>{fmtNum(row.pe.delta, 4)}</td>
+                        <td className={`px-3 text-left ${peItm ? "bg-amber-50 dark:bg-[#2b241d]" : ""}`}>{fmtNum(row.pe.theta, 4)}</td>
+                        <td className={`px-3 text-left ${peItm ? "bg-amber-50 dark:bg-[#2b241d]" : ""}`}>{fmtNum(row.pe.gamma, 4)}</td>
+                        <td className={`px-3 text-left ${peItm ? "bg-amber-50 dark:bg-[#2b241d]" : ""}`}>{fmtNum(row.pe.vega, 4)}</td>
+                        <td className={`px-3 text-left ${peItm ? "bg-amber-50 dark:bg-[#2b241d]" : ""}`}>{fmtNum(row.pe.iv, 2)}</td>
+                        <td className={`px-3 text-left ${peItm ? "bg-amber-50 dark:bg-[#2b241d]" : ""}`}>{fmtCompactIN(row.pe.volume)}</td>
                       </tr>
                     </Fragment>
                   );
@@ -731,12 +1027,12 @@ export default function OptionChain() {
           )}
         </div>
 
-        <div className="flex h-12 items-center justify-between border-t border-slate-200 bg-white px-4 dark:border-[#3b3344] dark:bg-[#19151f]">
+        <div className="flex h-12 items-center justify-between border-t border-slate-200 bg-white px-4 dark:border-[#223036] dark:bg-[#0f171a]">
           <div className="flex flex-1 items-center justify-center gap-5 text-[11px] text-slate-700 dark:text-white">
             <span className="inline-flex items-center gap-1"><span className="h-3 w-3 rounded-sm bg-amber-500 dark:bg-[#f1c46b]" /> Today's OI</span>
             <span className="inline-flex items-center gap-1"><span className="h-3 w-3 rounded-sm bg-amber-700 dark:bg-[#b78a43]" /> Yesterday's OI</span>
           </div>
-          <Button className="h-8 w-40 rounded bg-violet-800 text-xs font-semibold text-white hover:bg-violet-900 dark:bg-[#8d6bc5] dark:hover:bg-[#9b78d1]" onClick={() => navigate("/strategy")}>
+          <Button className="h-8 w-40 rounded bg-teal-700 text-xs font-semibold text-white hover:bg-teal-800 dark:bg-[#16877e] dark:hover:bg-[#1aa59a]" onClick={() => navigate("/strategy")}>
             Build Strategy
           </Button>
         </div>

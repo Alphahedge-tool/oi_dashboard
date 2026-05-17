@@ -1,5 +1,5 @@
 import { useMemo } from "react";
-import { useLiveIndices, useMarketStatus, useExpiryList, useAllIndices } from "@/hooks/useMarketData";
+import { useLiveIndices, useMarketStatus, useExpiryList, useAllIndices, useLiveOptionChain } from "@/hooks/useMarketData";
 import { getSpotPrice } from "@/lib/positionStore";
 import { DashboardSkeleton } from "@/components/LoadingSkeletons";
 import { ErrorBoundary } from "@/components/ErrorBoundary";
@@ -21,7 +21,9 @@ import { SectorHeatmap } from "@/components/dashboard/SectorHeatmap";
 import { MostActiveFnO } from "@/components/dashboard/MostActiveFnO";
 import { MarketBreadth } from "@/components/dashboard/MarketBreadth";
 import { SectionHeader } from "@/components/dashboard/SectionHeader";
-import { DataSourcesBar } from "@/components/dashboard/DataSourcesBar";
+import { MultiExpiryOI } from "@/components/MultiExpiryOI";
+import { IVSmileCard } from "@/components/IVSmileCard";
+import { TotalOIChart } from "@/components/TotalOIChart";
 
 const EXPIRY_CONTRACTS = [
   { symbol: "NIFTY", exchange: "NSE", lotSize: 25, type: "Weekly" },
@@ -50,6 +52,7 @@ export default function Index() {
   const { data: marketStatusResult } = useMarketStatus();
   const { data: niftyExpiry } = useExpiryList("NIFTY");
   const { data: bnfExpiry } = useExpiryList("BANKNIFTY");
+  const { data: niftyChainData } = useLiveOptionChain("NIFTY", niftyExpiry?.expiries?.[0]?.value);
   const { data: allIndicesData } = useAllIndices();
   const { vix: wsVix } = useWebSocketVix();
 
@@ -93,13 +96,29 @@ export default function Index() {
       <div className="space-y-3 animate-fade-in">
         {/* ═══ WELCOME + HEADER ═══ */}
         <MarketHeader isLive={isLive} isOpen={isOpen} marketStatus={marketStatus} />
-        <DataSourcesBar />
         <WelcomeBanner />
 
         {/* ═══ TICKER TAPE ═══ */}
         <TickerTape indices={indices} giftNifty={giftNifty} />
 
         {/* ═══ QUICK TRADE ACTIONS ═══ */}
+        <SectionHeader
+          title="OI Analysis Snapshot"
+          subtitle="Total OI, multi-expiry OI and live IV smile"
+          icon={<BarChart3 className="h-4 w-4" />}
+          tooltip="A compact NIFTY OI view from the OI Analysis page. Total OI summarizes CE/PE interest across expiries; Multi-expiry OI compares strike-wise OI; IV Smile shows CE, PE and average IV across strikes."
+        />
+        <div className="grid grid-cols-1 xl:grid-cols-2 gap-3">
+          <MultiExpiryOI symbol="NIFTY" compact showSignals={false} />
+          <IVSmileCard
+            symbol="NIFTY"
+            chain={niftyChainData?.chain || []}
+            spotPrice={niftyChainData?.spotPrice || indices[0]?.ltp || getSpotPrice("NIFTY")}
+            height={300}
+          />
+        </div>
+        <TotalOIChart symbol="NIFTY" />
+
         <SectionHeader
           title="Quick Actions"
           subtitle="Jump to any tool instantly"

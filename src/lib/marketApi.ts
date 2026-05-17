@@ -1,5 +1,5 @@
 import type { OptionData, ExpiryDate, IndexData } from "./mockData";
-import { getActiveBroker } from "./brokerConfig";
+import { getActiveBroker, getBrokerCredentials, saveBrokerCredentials, syncBrokerRuntimeKeys } from "./brokerConfig";
 
 // Local proxy base URL — override via VITE_PROXY_URL if deploying proxy elsewhere
 const PROXY_BASE = import.meta.env.VITE_PROXY_URL || "http://localhost:4002";
@@ -26,10 +26,10 @@ async function fetchDhanProxy(endpoint: string, params?: Record<string, string>)
 }
 
 async function fetchUpstoxProxy(endpoint: "option-chain" | "expiry-list", params?: Record<string, string>): Promise<any> {
-  const activeBroker = getActiveBroker();
+  const upstoxBroker = getBrokerCredentials("upstox");
   const headers: Record<string, string> = {};
-  if (activeBroker?.brokerId === "upstox" && activeBroker.values.accessToken) {
-    headers["x-upstox-access-token"] = activeBroker.values.accessToken;
+  if (upstoxBroker?.values.accessToken) {
+    headers["x-upstox-access-token"] = upstoxBroker.values.accessToken;
   }
 
   const qp = new URLSearchParams(params);
@@ -690,6 +690,41 @@ export async function fetchProxyHealth(): Promise<any> {
   return res.json();
 }
 
+// ── Upstox Instrument Master (Trishakti-style symbol universe) ──
+
+export interface UpstoxInstrument {
+  instrumentKey: string;
+  tradingSymbol: string;
+  symbol: string;
+  name: string;
+  exchange: string;
+  segment: string;
+  instrumentType: string;
+  underlyingSymbol?: string;
+  lotSize?: number;
+  tickSize?: number;
+  expiry?: string | number | null;
+  strike?: string | number | null;
+}
+
+export async function fetchUpstoxInstruments(params: {
+  mode?: "all" | "tradable" | "underlyings";
+  q?: string;
+  limit?: number;
+} = {}): Promise<UpstoxInstrument[]> {
+  const qp = new URLSearchParams({
+    format: "json",
+    mode: params.mode || "underlyings",
+  });
+  if (params.q) qp.set("q", params.q);
+  if (params.limit) qp.set("limit", String(params.limit));
+
+  const res = await fetch(`${PROXY_BASE}/api/upstox-instruments?${qp.toString()}`);
+  if (!res.ok) throw new Error(`Upstox instruments error ${res.status}: ${await res.text()}`);
+  const json = await res.json();
+  return json?.data || [];
+}
+
 function getSavedBrokerById(brokerId: string) {
   try {
     const raw = localStorage.getItem("optionsdesk_broker_keys");
@@ -701,13 +736,17 @@ function getSavedBrokerById(brokerId: string) {
 }
 
 function getNubraHeaders(): Record<string, string> {
-  const nubra = getSavedBrokerById("nubra");
-  if (!nubra) return {};
+  const nubra = getBrokerCredentials("nubra") || getSavedBrokerById("nubra");
+  const values = nubra?.values || {};
+  const sessionToken = values.sessionToken || values.session_token || localStorage.getItem("nubra_session_token") || "";
+  const authToken = values.authToken || values.auth_token || localStorage.getItem("nubra_auth_token") || "";
+  const deviceId = values.deviceId || values.device_id || localStorage.getItem("nubra_device_id") || "";
+  const rawCookie = values.rawCookie || values.raw_cookie || localStorage.getItem("nubra_raw_cookie") || "";
   return {
-    ...(nubra.values.sessionToken ? { "x-session-token": nubra.values.sessionToken } : {}),
-    ...(nubra.values.authToken ? { "x-auth-token": nubra.values.authToken } : {}),
-    ...(nubra.values.deviceId ? { "x-device-id": nubra.values.deviceId } : {}),
-    ...(nubra.values.rawCookie ? { "x-raw-cookie": nubra.values.rawCookie } : {}),
+    ...(sessionToken ? { "x-session-token": sessionToken } : {}),
+    ...(authToken ? { "x-auth-token": authToken } : {}),
+    ...(deviceId ? { "x-device-id": deviceId } : {}),
+    ...(rawCookie ? { "x-raw-cookie": rawCookie } : {}),
   };
 }
 
@@ -718,13 +757,81 @@ export async function fetchNubraInstruments(): Promise<any> {
 }
 
 export async function fetchNubraTimeseries(chart: string, query: any[]): Promise<any> {
+  const headers = { ...getNubraHeaders(), "Content-Type": "application/json" };
   const res = await fetch(`${PROXY_BASE}/api/nubra-timeseries`, {
     method: "POST",
-    headers: { ...getNubraHeaders(), "Content-Type": "application/json" },
+    headers,
     body: JSON.stringify({ chart, query }),
   });
-  if (!res.ok) throw new Error(`Nubra timeseries error ${res.status}: ${await res.text()}`);
+  if (!res.ok) {
+    const text = await res.text();
+    if (isNubraUnauthorized(text) && await refreshNubraSession()) {
+      const retry = await fetch(`${PROXY_BASE}/api/nubra-timeseries`, {
+        method: "POST",
+        headers: { ...getNubraHeaders(), "Content-Type": "application/json" },
+        body: JSON.stringify({ chart, query }),
+      });
+      if (retry.ok) return retry.json();
+      const retryText = await retry.text();
+      throw new Error(cleanNubraError(retryText, retry.status));
+    }
+    throw new Error(cleanNubraError(text, res.status));
+  }
   return res.json();
+}
+
+function isNubraUnauthorized(text: string): boolean {
+  return /401|unauthori[sz]ed|session/i.test(text || "");
+}
+
+function cleanNubraError(text: string, status: number): string {
+  if (isNubraUnauthorized(text)) {
+    return "Nubra session expired. Reconnect Nubra from Broker API Keys, or save mobile/MPIN/TOTP for auto-login.";
+  }
+  try {
+    const parsed = JSON.parse(text);
+    if (parsed?.error) return `Nubra timeseries error: ${parsed.error}`;
+  } catch { /* ignore */ }
+  return `Nubra timeseries error ${status}`;
+}
+
+async function refreshNubraSession(): Promise<boolean> {
+  const saved = getBrokerCredentials("nubra") || getSavedBrokerById("nubra");
+  const values = saved?.values || {};
+  const phone = values.phone || localStorage.getItem("nubra_phone") || "";
+  const mpin = values.mpin || localStorage.getItem("nubra_mpin") || "";
+  const totpSecret = values.totpSecret || values.totp_secret || localStorage.getItem("nubra_totp_secret") || "";
+  if (!phone || !mpin || !totpSecret) return false;
+
+  const res = await fetch(`${PROXY_BASE}/api/nubra-login`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ phone, mpin, totp_secret: totpSecret }),
+  });
+  if (!res.ok) return false;
+  const data = await res.json().catch(() => ({}));
+  if (!data?.session_token) return false;
+
+  const nextValues = {
+    ...values,
+    phone,
+    mpin,
+    totpSecret,
+    sessionToken: data.session_token || "",
+    authToken: data.auth_token || "",
+    deviceId: data.device_id || "",
+    rawCookie: data.raw_cookie || `authToken=${data.auth_token || ""}; sessionToken=${data.session_token || ""}`,
+  };
+  saveBrokerCredentials({
+    brokerId: "nubra",
+    values: nextValues,
+    addedAt: saved?.addedAt || new Date().toISOString(),
+    isActive: saved?.isActive || false,
+  });
+  syncBrokerRuntimeKeys("nubra", nextValues);
+  localStorage.setItem("nubra_login_date", new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Kolkata" }));
+  localStorage.setItem("nubra_login_ts", String(Date.now()));
+  return true;
 }
 
 // ── Instrument Master Download ──

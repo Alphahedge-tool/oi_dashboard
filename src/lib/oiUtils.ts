@@ -152,7 +152,8 @@ export function getATMIV(chain: OptionData[], spotPrice: number): { atmIV: numbe
     Math.abs(a.strikePrice - spotPrice) - Math.abs(b.strikePrice - spotPrice)
   );
   const atm = sorted[0];
-  const atmIV = (atm.ce.iv + atm.pe.iv) / 2;
+  const atmIVs = [atm.ce.iv, atm.pe.iv].filter(iv => Number.isFinite(iv) && iv > 0);
+  const atmIV = atmIVs.length > 0 ? atmIVs.reduce((sum, iv) => sum + iv, 0) / atmIVs.length : 0;
   return { atmIV, atmStrike: atm.strikePrice };
 }
 
@@ -202,18 +203,29 @@ export function getIVPercentileFromChain(chain: OptionData[], spotPrice: number)
  */
 export function getIVSkew(chain: OptionData[]): {
   strike: number;
-  callIV: number;
-  putIV: number;
+  callIV: number | null;
+  putIV: number | null;
   avgIV: number;
 }[] {
   return chain
-    .filter(o => o.ce.iv > 0 || o.pe.iv > 0)
-    .map(o => ({
-      strike: o.strikePrice,
-      callIV: o.ce.iv,
-      putIV: o.pe.iv,
-      avgIV: (o.ce.iv + o.pe.iv) / 2,
-    }));
+    .map(o => {
+      const ceIV = Number(o.ce.iv || 0);
+      const peIV = Number(o.pe.iv || 0);
+      const callIV = Number.isFinite(ceIV) && ceIV > 0 ? ceIV : null;
+      const putIV = Number.isFinite(peIV) && peIV > 0 ? peIV : null;
+      const validIVs = [callIV, putIV].filter((iv): iv is number => iv !== null);
+
+      if (validIVs.length === 0) return null;
+
+      return {
+        strike: o.strikePrice,
+        callIV,
+        putIV,
+        avgIV: validIVs.reduce((sum, iv) => sum + iv, 0) / validIVs.length,
+      };
+    })
+    .filter((row): row is { strike: number; callIV: number | null; putIV: number | null; avgIV: number } => row !== null)
+    .sort((a, b) => a.strike - b.strike);
 }
 
 /**

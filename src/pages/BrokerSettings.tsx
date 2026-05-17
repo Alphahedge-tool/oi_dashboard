@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
@@ -14,6 +14,9 @@ import {
   removeBrokerCredentials,
   setActiveBroker,
   getActiveBroker,
+  syncBrokerRuntimeKeys,
+  clearBrokerRuntimeKeys,
+  syncSavedBrokerRuntimeKeys,
   type BrokerInfo,
   type BrokerCredentials,
 } from "@/lib/brokerConfig";
@@ -28,6 +31,8 @@ import {
 } from "lucide-react";
 import { DatabaseManager } from "@/components/DatabaseManager";
 import { ChartDataDownloader } from "@/components/ChartDataDownloader";
+
+const PROXY_BASE = import.meta.env.VITE_PROXY_URL || "http://localhost:4002";
 
 function BrokerCard({
   broker,
@@ -165,6 +170,222 @@ function BrokerCard({
   );
 }
 
+function NubraAutoLoginPanel({
+  saved,
+  onSaved,
+}: {
+  saved?: BrokerCredentials;
+  onSaved: () => void;
+}) {
+  const [values, setValues] = useState<Record<string, string>>({
+    phone: saved?.values.phone || localStorage.getItem("nubra_phone") || "",
+    mpin: saved?.values.mpin || localStorage.getItem("nubra_mpin") || "",
+    totpSecret: saved?.values.totpSecret || localStorage.getItem("nubra_totp_secret") || "",
+  });
+  const [otp, setOtp] = useState("");
+  const [tempToken, setTempToken] = useState("");
+  const [phase, setPhase] = useState<"idle" | "otp" | "reenable">("idle");
+  const [loading, setLoading] = useState(false);
+
+  const persistNubra = (nextValues: Record<string, string>) => {
+    const merged = { ...(saved?.values || {}), ...nextValues };
+    saveBrokerCredentials({
+      brokerId: "nubra",
+      values: merged,
+      addedAt: saved?.addedAt || new Date().toISOString(),
+      isActive: saved?.isActive || false,
+    });
+    syncBrokerRuntimeKeys("nubra", merged);
+    onSaved();
+  };
+
+  const postNubra = async (path: string, body: Record<string, string>) => {
+    const res = await fetch(`${PROXY_BASE}${path}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok && res.status !== 202) throw new Error(data.error || data.message || `Nubra ${path} failed`);
+    return { data, status: res.status };
+  };
+
+  const saveSession = (data: any, extra: Record<string, string> = {}) => {
+    const sessionToken = data.session_token || "";
+    const authToken = data.auth_token || "";
+    const deviceId = data.device_id || "";
+    const rawCookie = data.raw_cookie || `authToken=${authToken}; sessionToken=${sessionToken}`;
+    const nextValues = {
+      ...values,
+      ...extra,
+      sessionToken,
+      authToken,
+      deviceId,
+      rawCookie,
+    };
+    setValues(nextValues);
+    persistNubra(nextValues);
+    localStorage.setItem("nubra_login_date", new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Kolkata" }));
+    localStorage.setItem("nubra_login_ts", String(Date.now()));
+  };
+
+  const sendOtp = async () => {
+    if (!values.phone || !values.mpin) {
+      toast.error("Enter Nubra mobile number and MPIN first");
+      return;
+    }
+    setLoading(true);
+    try {
+      persistNubra(values);
+      const { data } = await postNubra("/api/nubra-send-otp", { phone: values.phone });
+      setTempToken(data.temp_token || "");
+      setPhase("otp");
+      toast.success("Nubra OTP sent");
+    } catch (e: any) {
+      toast.error(e.message || "Failed to send Nubra OTP");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const verifyOtpSetup = async () => {
+    if (!otp || !tempToken) {
+      toast.error("Enter OTP first");
+      return;
+    }
+    setLoading(true);
+    try {
+      const { data } = await postNubra("/api/nubra-setup-totp", {
+        phone: values.phone,
+        mpin: values.mpin,
+        otp,
+        temp_token: tempToken,
+      });
+      saveSession(data, { totpSecret: data.secret_key || values.totpSecret });
+      setOtp("");
+      setTempToken("");
+      setPhase("idle");
+      toast.success("Nubra TOTP generated and session connected");
+    } catch (e: any) {
+      toast.error(e.message || "Nubra OTP verification failed");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const autoLogin = async () => {
+    if (!values.phone || !values.mpin || !values.totpSecret) {
+      toast.error("Need mobile, MPIN, and TOTP secret. Use Send OTP first if secret is missing.");
+      return;
+    }
+    setLoading(true);
+    try {
+      persistNubra(values);
+      const { data, status } = await postNubra("/api/nubra-login", {
+        phone: values.phone,
+        mpin: values.mpin,
+        totp_secret: values.totpSecret,
+      });
+      if (status === 202 && data.error === "totp_not_enabled") {
+        setTempToken(data.temp_token || "");
+        setPhase("reenable");
+        toast.info("Nubra needs OTP to re-enable TOTP");
+        return;
+      }
+      saveSession(data);
+      toast.success("Nubra auto-login connected");
+    } catch (e: any) {
+      toast.error(e.message || "Nubra auto-login failed");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const reenableTotp = async () => {
+    if (!otp || !tempToken) {
+      toast.error("Enter OTP first");
+      return;
+    }
+    setLoading(true);
+    try {
+      const { data } = await postNubra("/api/nubra-otp-reenable-totp", {
+        phone: values.phone,
+        mpin: values.mpin,
+        otp,
+        temp_token: tempToken,
+        totp_secret: values.totpSecret,
+      });
+      saveSession(data, { totpSecret: data.secret_key || values.totpSecret });
+      setOtp("");
+      setTempToken("");
+      setPhase("idle");
+      toast.success("Nubra TOTP re-enabled and connected");
+    } catch (e: any) {
+      toast.error(e.message || "Failed to re-enable Nubra TOTP");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <Card className="border-teal-500/25 bg-teal-500/5">
+      <CardHeader className="pb-3">
+        <CardTitle className="text-sm flex items-center gap-2">
+          <Key className="h-4 w-4 text-teal-500" />
+          Nubra OTP / Auto Login
+          {saved?.values.sessionToken && <Badge className="ml-auto text-2xs">Session Saved</Badge>}
+        </CardTitle>
+        <CardDescription className="text-xs">Generate Nubra session/auth/device tokens from mobile OTP, then reconnect later using the saved TOTP secret.</CardDescription>
+      </CardHeader>
+      <CardContent className="grid gap-3 md:grid-cols-[1fr_1fr_1.4fr_auto]">
+        <Input
+          placeholder="Mobile number"
+          value={values.phone || ""}
+          onChange={(e) => setValues((prev) => ({ ...prev, phone: e.target.value }))}
+        />
+        <Input
+          placeholder="MPIN"
+          type="password"
+          value={values.mpin || ""}
+          onChange={(e) => setValues((prev) => ({ ...prev, mpin: e.target.value }))}
+        />
+        <Input
+          placeholder="TOTP secret auto-generated after OTP setup"
+          type="password"
+          value={values.totpSecret || ""}
+          onChange={(e) => setValues((prev) => ({ ...prev, totpSecret: e.target.value }))}
+        />
+        <div className="flex gap-2">
+          <Button variant="outline" onClick={sendOtp} disabled={loading}>
+            {loading ? <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" /> : null}
+            Send OTP
+          </Button>
+          <Button onClick={autoLogin} disabled={loading || !values.totpSecret}>
+            Auto Login
+          </Button>
+        </div>
+
+        {phase !== "idle" && (
+          <div className="md:col-span-4 flex flex-wrap items-center gap-2 rounded-md border border-teal-500/20 bg-background/70 p-2">
+            <Input
+              className="max-w-40"
+              placeholder="OTP"
+              value={otp}
+              onChange={(e) => setOtp(e.target.value)}
+            />
+            <Button onClick={phase === "reenable" ? reenableTotp : verifyOtpSetup} disabled={loading}>
+              {phase === "reenable" ? "Re-enable TOTP" : "Verify OTP & Generate Secret"}
+            </Button>
+            <span className="text-xs text-muted-foreground">
+              {phase === "reenable" ? "Nubra asked to re-enable TOTP." : "This will create the TOTP secret and session tokens."}
+            </span>
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
 function ConnectionStatusPanel() {
   const { data: health } = useProxyHealth();
   const wsConnected = useWebSocketStatus();
@@ -292,6 +513,10 @@ export default function BrokerSettings() {
   const [savedBrokers, setSavedBrokers] = useState(getSavedBrokers());
   const activeBroker = getActiveBroker();
 
+  useEffect(() => {
+    syncSavedBrokerRuntimeKeys();
+  }, []);
+
   const refreshMarketData = () => {
     resetProxyStatus();
     queryClient.invalidateQueries();
@@ -306,6 +531,7 @@ export default function BrokerSettings() {
       isActive: shouldActivate,
     };
     saveBrokerCredentials(creds);
+    syncBrokerRuntimeKeys(brokerId, values);
     if (shouldActivate) setActiveBroker(brokerId);
     if (brokerId === "upstox") {
       upstoxWS.disconnect();
@@ -318,6 +544,7 @@ export default function BrokerSettings() {
 
   const handleRemove = (brokerId: string) => {
     removeBrokerCredentials(brokerId);
+    clearBrokerRuntimeKeys(brokerId);
     if (brokerId === "upstox") upstoxWS.disconnect();
     setSavedBrokers(getSavedBrokers());
     refreshMarketData();
@@ -370,6 +597,14 @@ export default function BrokerSettings() {
 
       {/* Connection Status Panel */}
       <ConnectionStatusPanel />
+
+      <NubraAutoLoginPanel
+        saved={savedBrokers.find((broker) => broker.brokerId === "nubra")}
+        onSaved={() => {
+          setSavedBrokers(getSavedBrokers());
+          refreshMarketData();
+        }}
+      />
 
       {/* Database Manager */}
       <DatabaseManager />

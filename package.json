@@ -4,11 +4,11 @@
   "description": "India's most comprehensive open-source Options & Futures analytics terminal for NSE F&O traders.",
   "private": false,
   "type": "module",
-  "author": "MrChartist",
+  "author": "Trishakti",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/MrChartist/india-s-best-option-hub.git"
+    "url": "https://github.com/trishakti/options-terminal.git"
   },
   "keywords": [
     "options-trading",

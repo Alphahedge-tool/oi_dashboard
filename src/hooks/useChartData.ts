@@ -1,4 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
+import { fetchUpstoxInstruments } from "@/lib/marketApi";
 
 const PROXY_BASE = "http://localhost:4002";
 
@@ -83,6 +84,99 @@ if (!SECURITY_MAP["M&M"]) SECURITY_MAP["M&M"] = SECURITY_MAP["M_M"];
 
 // ── In-memory cache for dynamically resolved security IDs ──
 const resolvedSecurityIds: Record<string, { securityId: string; exchangeSegment: string; instrument: string }> = {};
+const UPSTOX_INDEX_KEYS: Record<string, string> = {
+  NIFTY: "NSE_INDEX|Nifty 50",
+  BANKNIFTY: "NSE_INDEX|Nifty Bank",
+  FINNIFTY: "NSE_INDEX|Nifty Fin Service",
+  MIDCPNIFTY: "NSE_INDEX|Nifty Midcap Select",
+  SENSEX: "BSE_INDEX|SENSEX",
+  BANKEX: "BSE_INDEX|BANKEX",
+};
+const resolvedUpstoxKeys: Record<string, string> = {};
+
+function normalizeSymbol(symbol: string) {
+  return symbol.toUpperCase().replace(/[^A-Z0-9]/g, "");
+}
+
+async function resolveUpstoxInstrumentKey(symbol: string): Promise<string | null> {
+  const upper = symbol.toUpperCase();
+  if (UPSTOX_INDEX_KEYS[upper]) return UPSTOX_INDEX_KEYS[upper];
+  if (resolvedUpstoxKeys[upper]) return resolvedUpstoxKeys[upper];
+
+  try {
+    const instruments = await fetchUpstoxInstruments({ mode: "tradable", q: upper, limit: 80 });
+    const normalized = normalizeSymbol(upper);
+    const match = instruments.find((item) => {
+      const type = String(item.instrumentType || "").toUpperCase();
+      if (!["EQ", "EQUITY", "INDEX"].includes(type)) return false;
+      return normalizeSymbol(item.tradingSymbol || item.symbol || item.name) === normalized;
+    });
+    if (match?.instrumentKey) {
+      resolvedUpstoxKeys[upper] = match.instrumentKey;
+      return match.instrumentKey;
+    }
+  } catch {
+    // Fall back to Dhan/Yahoo path below.
+  }
+  return null;
+}
+
+function normalizeUpstoxCandle(row: any): OHLCVCandle | null {
+  if (!Array.isArray(row) || row.length < 5) return null;
+  const rawTime = row[0];
+  const parsed = typeof rawTime === "number"
+    ? rawTime
+    : Date.parse(rawTime);
+  if (!Number.isFinite(parsed)) return null;
+  return {
+    time: parsed > 10_000_000_000 ? Math.floor(parsed / 1000) : Math.floor(parsed),
+    open: Number(row[1]),
+    high: Number(row[2]),
+    low: Number(row[3]),
+    close: Number(row[4]),
+    volume: Number(row[5] || 0),
+  };
+}
+
+async function fetchUpstoxHistorical(symbol: string, range: string): Promise<OHLCVCandle[]> {
+  const instrumentKey = await resolveUpstoxInstrumentKey(symbol);
+  if (!instrumentKey) return [];
+
+  const interval = range === "1W" ? "I15" : range === "1M" ? "I60" : "I1D";
+  const pages = range === "1Y" ? 4 : range === "6M" ? 3 : range === "3M" ? 2 : 1;
+  const rows: any[] = [];
+  let from = new Date().setHours(23, 59, 59, 999);
+
+  for (let attempt = 0; attempt < pages; attempt += 1) {
+    const params = new URLSearchParams({
+      instrumentKey,
+      interval,
+      from: String(from),
+      limit: "500",
+    });
+    const res = await fetch(`${PROXY_BASE}/api/upstox-public-candles?${params.toString()}`, {
+      signal: AbortSignal.timeout(15000),
+    });
+    if (!res.ok) break;
+    const json = await res.json();
+    const pageRows = json?.data?.candles || json?.candles || [];
+    rows.push(...pageRows);
+    const prev = json?.data?.meta?.prevTimestamp;
+    if (!prev || pageRows.length === 0) break;
+    from = prev;
+  }
+
+  const seen = new Set<number>();
+  return rows
+    .map(normalizeUpstoxCandle)
+    .filter((c): c is OHLCVCandle => !!c && Number.isFinite(c.close))
+    .sort((a, b) => a.time - b.time)
+    .filter((c) => {
+      if (seen.has(c.time)) return false;
+      seen.add(c.time);
+      return true;
+    });
+}
 
 /**
  * Resolve a stock symbol to its Dhan securityId.
@@ -124,6 +218,9 @@ async function resolveSecurityId(symbol: string): Promise<{ securityId: string; 
  * Uses /api/dhan-proxy?endpoint=historical
  */
 async function fetchHistorical(symbol: string, range: string): Promise<OHLCVCandle[]> {
+  const upstoxCandles = await fetchUpstoxHistorical(symbol, range);
+  if (upstoxCandles.length > 0) return upstoxCandles;
+
   const resolved = await resolveSecurityId(symbol);
   if (!resolved) return [];
 

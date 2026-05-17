@@ -1,4 +1,4 @@
-import { BarChart3, Briefcase, LayoutDashboard, Layers, Moon, Settings, Star, Sun, TableProperties } from "lucide-react";
+import { Activity, BarChart3, Briefcase, LayoutDashboard, Layers, Moon, Settings, Star, Sun, TableProperties } from "lucide-react";
 import { NavLink } from "@/components/NavLink";
 import {
   Sidebar,
@@ -27,6 +27,8 @@ const mainItems = [
 const tradingItems = [
   { title: "Strategy Builder", url: "/strategy-builder", icon: Layers, shortcut: "5" },
   { title: "Position Tracker", url: "/position-tracker", icon: Briefcase, shortcut: "6" },
+  { title: "Auto Rolling Straddle", url: "/auto-rolling-straddle", icon: Activity, shortcut: "7" },
+  { title: "Vega Pulse", url: "/vega-pulse", icon: Activity, shortcut: "8" },
 ];
 
 const settingItems = [
@@ -78,26 +80,28 @@ export function AppSidebar() {
       <SidebarHeader className={cn("border-b border-sidebar-border/80 px-4 py-4", collapsed && "items-center border-white/10 px-0 py-3")}>
         <div className={cn("flex items-center gap-3", collapsed && "justify-center gap-0")}>
           <div className={cn("group relative flex h-9 w-9 items-center justify-center overflow-hidden rounded-lg border border-primary/25 bg-[#071018] shadow-glow-sm", collapsed && "h-10 w-10 rounded-xl border-primary/30")}>
-            <div className="absolute inset-0 bg-[linear-gradient(145deg,hsl(var(--primary)/0.2),transparent_72%)] opacity-95 transition-opacity duration-500" />
+            <div className="absolute inset-0 bg-[radial-gradient(circle_at_50%_18%,hsl(var(--primary)/0.28),transparent_58%),linear-gradient(145deg,hsl(var(--primary)/0.16),transparent_76%)] opacity-95 transition-opacity duration-500" />
             
             <svg width="22" height="22" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" className="relative z-10" aria-hidden="true">
-              <path d="M12 2L2 7V17L12 22L22 17V7L12 2Z" stroke="hsl(var(--primary))" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" opacity="0.75" />
-              <path d="M6 16V10L9 13L12 9L15 7V16" stroke="hsl(var(--primary))" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
-              <circle cx="15" cy="7" r="1.8" fill="hsl(var(--primary))" opacity="0.9">
-              </circle>
+              <path d="M12 3V20" stroke="hsl(var(--primary))" strokeWidth="2.25" strokeLinecap="round" />
+              <path d="M6.5 7.5L12 3L17.5 7.5" stroke="hsl(var(--primary))" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round" />
+              <path d="M7.25 6.75V10.5C7.25 12.25 8.65 13.6 10.4 13.6H12" stroke="hsl(var(--primary))" strokeWidth="1.65" strokeLinecap="round" />
+              <path d="M16.75 6.75V10.5C16.75 12.25 15.35 13.6 13.6 13.6H12" stroke="hsl(var(--primary))" strokeWidth="1.65" strokeLinecap="round" />
+              <path d="M8.25 18.25H15.75" stroke="hsl(var(--primary))" strokeWidth="1.8" strokeLinecap="round" />
+              <circle cx="12" cy="12" r="2.15" fill="hsl(var(--primary))" opacity="0.9" />
             </svg>
           </div>
           {!collapsed && (
             <div className="flex flex-col">
-              <h1 className="text-[15px] font-bold text-foreground leading-none">Mr. Chartist</h1>
+              <h1 className="text-[15px] font-bold text-foreground leading-none">Trishakti</h1>
               <p className="text-[11px] text-muted-foreground/75 mt-1 tracking-[0.14em] font-semibold uppercase">Options Terminal</p>
             </div>
           )}
         </div>
         {collapsed && (
           <div className="mt-1 text-center leading-none">
-            <p className="text-[9px] font-bold uppercase tracking-[0.2em] text-primary">MR</p>
-            <p className="mt-1 text-[6px] font-semibold uppercase tracking-[0.1em] text-white/38">Chartist</p>
+            <p className="text-[9px] font-bold uppercase tracking-[0.2em] text-primary">TRI</p>
+            <p className="mt-1 text-[6px] font-semibold uppercase tracking-[0.1em] text-white/38">Shakti</p>
           </div>
         )}
       </SidebarHeader>
@@ -145,7 +149,7 @@ export function AppSidebar() {
         <button
           onClick={toggleTheme}
           className={cn(
-            "group flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-sm font-medium text-sidebar-foreground/85 transition-all duration-200 hover:bg-sidebar-accent/70 hover:text-sidebar-accent-foreground",
+            "group flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-sm font-medium text-sidebar-foreground/85 transition-colors duration-150 hover:bg-sidebar-accent/70 hover:text-sidebar-accent-foreground",
             collapsed && "h-10 w-10 justify-center rounded-xl px-0 py-0 text-white/65 hover:bg-white/10 hover:text-white",
           )}
           title={collapsed ? (isDark ? "Light Mode" : "Dark Mode") : undefined}

@@ -10,7 +10,7 @@ import { OIHeatmap } from "@/components/OIHeatmap";
 import { SupportResistance } from "@/components/SupportResistance";
 import { MultiExpiryOI } from "@/components/MultiExpiryOI";
 import { IVPercentileGauge } from "@/components/IVPercentileGauge";
-import { useLiveOptionChain } from "@/hooks/useMarketData";
+import { useExpiryList, useLiveOptionChain } from "@/hooks/useMarketData";
 import { Wifi, WifiOff, RefreshCw, Loader2, Keyboard } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
@@ -19,7 +19,16 @@ export default function OIAnalysis() {
   const [symbol, setSymbol] = useState("NIFTY");
   const [atmZoneSize, setATMZoneSize] = useState<number>(5);
   const { data: liveData, refetch, isLoading } = useLiveOptionChain(symbol);
+  const { data: expiryData } = useExpiryList(symbol);
   const chain = liveData?.chain || [];
+  const expiries = expiryData?.expiries || liveData?.expiries || [];
+  const visibleExpiries = expiries.slice(0, 3);
+  const exp1 = visibleExpiries[0]?.value;
+  const exp2 = visibleExpiries[1]?.value;
+  const exp3 = visibleExpiries[2]?.value;
+  const { data: multiChain1 } = useLiveOptionChain(symbol, exp1);
+  const { data: multiChain2 } = useLiveOptionChain(symbol, exp2);
+  const { data: multiChain3 } = useLiveOptionChain(symbol, exp3);
   const spotPrice = liveData?.spotPrice || 0;
   const stepSize = liveData?.stepSize || 50;
   const isLive = liveData?.isLive || false;
@@ -50,24 +59,51 @@ export default function OIAnalysis() {
   }, [chain]);
 
   const ivSmileData = useMemo(() => {
-    return chain.map(o => ({
-      strike: o.strikePrice,
-      callIV: o.ce.iv,
-      putIV: o.pe.iv,
-      avgIV: (o.ce.iv + o.pe.iv) / 2,
-    }));
-  }, [chain]);
+    const atm = Math.round(spotPrice / stepSize) * stepSize;
+    return chain
+      .map(o => {
+        const callIV = Number(o.ce.iv || 0);
+        const putIV = Number(o.pe.iv || 0);
+        const ivs = [callIV, putIV].filter((iv) => Number.isFinite(iv) && iv > 0);
+        return {
+          strike: o.strikePrice,
+          callIV: callIV > 0 ? callIV : null,
+          putIV: putIV > 0 ? putIV : null,
+          avgIV: ivs.length ? ivs.reduce((sum, iv) => sum + iv, 0) / ivs.length : null,
+          distance: Math.abs(o.strikePrice - atm),
+        };
+      })
+      .filter((row) => row.avgIV != null)
+      .sort((a, b) => a.strike - b.strike);
+  }, [chain, spotPrice, stepSize]);
 
   const multiExpiryData = useMemo(() => {
-    const baseChain = chain.filter(o => o.ce.oi > 50000 || o.pe.oi > 50000);
-    return baseChain.map(o => ({
-      strike: o.strikePrice,
-      ceOI_weekly: Math.round(o.ce.oi / 1000),
-      peOI_weekly: Math.round(o.pe.oi / 1000),
-      ceOI_monthly: Math.round(o.ce.oi * 0.6 / 1000),
-      peOI_monthly: Math.round(o.pe.oi * 0.7 / 1000),
-    }));
-  }, [chain]);
+    const chains = [multiChain1, multiChain2, multiChain3];
+    const atm = Math.round(spotPrice / stepSize) * stepSize;
+    const allStrikes = new Set<number>();
+
+    chains.forEach((data) => {
+      data?.chain?.forEach((row) => {
+        if (Math.abs(row.strikePrice - atm) <= stepSize * 15 && (row.ce.oi > 0 || row.pe.oi > 0)) {
+          allStrikes.add(row.strikePrice);
+        }
+      });
+    });
+
+    return Array.from(allStrikes)
+      .sort((a, b) => a - b)
+      .map((strike) => {
+        const row: Record<string, number> = { strike };
+        chains.forEach((data, idx) => {
+          const opt = data?.chain?.find((item) => item.strikePrice === strike);
+          row[`ceOI_exp${idx}`] = opt ? Math.round(opt.ce.oi / 1000) : 0;
+          row[`peOI_exp${idx}`] = opt ? Math.round(opt.pe.oi / 1000) : 0;
+        });
+        return row;
+      });
+  }, [multiChain1, multiChain2, multiChain3, spotPrice, stepSize]);
+
+  const multiExpiryLabels = visibleExpiries.map((expiry, index) => expiry?.label || `Expiry ${index + 1}`);
 
   // ── NEW: Delta OI ──
   const deltaOIData = useMemo(() => getDeltaOI(chain, spotPrice, stepSize), [chain, spotPrice, stepSize]);
@@ -524,22 +560,30 @@ export default function OIAnalysis() {
 
         <TabsContent value="multi-expiry">
           <Card className={moduleCardClass}>
-            <CardHeader className={moduleHeaderClass}><CardTitle className="text-sm">Multi-Expiry OI Comparison (Weekly vs Monthly)</CardTitle></CardHeader>
+            <CardHeader className={moduleHeaderClass}><CardTitle className="text-sm">Multi-Expiry OI Comparison</CardTitle></CardHeader>
             <CardContent>
               <div className="h-[400px]">
-                <ResponsiveContainer width="100%" height="100%">
-                  <BarChart data={multiExpiryData} barGap={0} barCategoryGap="15%">
-                    <CartesianGrid strokeDasharray="3 3" stroke="hsl(var(--chart-grid))" />
-                    <XAxis dataKey="strike" tick={{ fontSize: 9, fill: "hsl(var(--muted-foreground))" }} />
-                    <YAxis tick={{ fontSize: 9, fill: "hsl(var(--muted-foreground))" }} />
-                    <Tooltip contentStyle={tooltipStyle} />
-                    <ReferenceLine x={Math.round(spotPrice / 50) * 50} stroke="hsl(210 100% 52%)" strokeDasharray="3 3" />
-                    <Bar dataKey="ceOI_weekly" fill="hsl(142 71% 45%)" opacity={0.9} name="CE Weekly" radius={[2, 2, 0, 0]} />
-                    <Bar dataKey="ceOI_monthly" fill="hsl(142 71% 45% / 0.4)" name="CE Monthly" radius={[2, 2, 0, 0]} />
-                    <Bar dataKey="peOI_weekly" fill="hsl(0 84% 60%)" opacity={0.9} name="PE Weekly" radius={[2, 2, 0, 0]} />
-                    <Bar dataKey="peOI_monthly" fill="hsl(0 84% 60% / 0.4)" name="PE Monthly" radius={[2, 2, 0, 0]} />
-                  </BarChart>
-                </ResponsiveContainer>
+                {multiExpiryData.length === 0 ? (
+                  <div className="flex h-full items-center justify-center text-sm text-muted-foreground">
+                    Multi-expiry data unavailable. Check Upstox token/proxy and expiry list.
+                  </div>
+                ) : (
+                  <ResponsiveContainer width="100%" height="100%">
+                    <BarChart data={multiExpiryData} barGap={0} barCategoryGap="15%">
+                      <CartesianGrid strokeDasharray="3 3" stroke="hsl(var(--chart-grid))" />
+                      <XAxis dataKey="strike" tick={{ fontSize: 9, fill: "hsl(var(--muted-foreground))" }} />
+                      <YAxis tick={{ fontSize: 9, fill: "hsl(var(--muted-foreground))" }} />
+                      <Tooltip contentStyle={tooltipStyle} />
+                      <ReferenceLine x={Math.round(spotPrice / stepSize) * stepSize} stroke="hsl(210 100% 52%)" strokeDasharray="3 3" />
+                      <Bar dataKey="ceOI_exp0" fill="hsl(142 71% 45%)" opacity={0.9} name={`CE ${multiExpiryLabels[0] || "Expiry 1"}`} radius={[2, 2, 0, 0]} />
+                      <Bar dataKey="peOI_exp0" fill="hsl(0 84% 60%)" opacity={0.9} name={`PE ${multiExpiryLabels[0] || "Expiry 1"}`} radius={[2, 2, 0, 0]} />
+                      <Bar dataKey="ceOI_exp1" fill="hsl(142 71% 45% / 0.55)" name={`CE ${multiExpiryLabels[1] || "Expiry 2"}`} radius={[2, 2, 0, 0]} />
+                      <Bar dataKey="peOI_exp1" fill="hsl(0 84% 60% / 0.55)" name={`PE ${multiExpiryLabels[1] || "Expiry 2"}`} radius={[2, 2, 0, 0]} />
+                      <Bar dataKey="ceOI_exp2" fill="hsl(142 71% 45% / 0.28)" name={`CE ${multiExpiryLabels[2] || "Expiry 3"}`} radius={[2, 2, 0, 0]} />
+                      <Bar dataKey="peOI_exp2" fill="hsl(0 84% 60% / 0.28)" name={`PE ${multiExpiryLabels[2] || "Expiry 3"}`} radius={[2, 2, 0, 0]} />
+                    </BarChart>
+                  </ResponsiveContainer>
+                )}
               </div>
             </CardContent>
           </Card>
@@ -550,18 +594,24 @@ export default function OIAnalysis() {
             <CardHeader className={moduleHeaderClass}><CardTitle className="text-sm">IV Smile / Skew Curve</CardTitle></CardHeader>
             <CardContent>
               <div className="h-[400px]">
-                <ResponsiveContainer width="100%" height="100%">
-                  <LineChart data={ivSmileData}>
-                    <CartesianGrid strokeDasharray="3 3" stroke="hsl(var(--chart-grid))" />
-                    <XAxis dataKey="strike" tick={{ fontSize: 9, fill: "hsl(var(--muted-foreground))" }} />
-                    <YAxis tick={{ fontSize: 9, fill: "hsl(var(--muted-foreground))" }} domain={["auto", "auto"]} label={{ value: "IV %", angle: -90, position: "insideLeft", fill: "hsl(var(--muted-foreground))", fontSize: 10 }} />
-                    <Tooltip contentStyle={tooltipStyle} />
-                    <ReferenceLine x={Math.round(spotPrice / 50) * 50} stroke="hsl(210 100% 52%)" strokeDasharray="5 5" label={{ value: "ATM", fill: "hsl(210 100% 52%)", fontSize: 9 }} />
-                    <Line type="monotone" dataKey="callIV" stroke="hsl(142 71% 45%)" strokeWidth={2} dot={false} name="Call IV" />
-                    <Line type="monotone" dataKey="putIV" stroke="hsl(0 84% 60%)" strokeWidth={2} dot={false} name="Put IV" />
-                    <Line type="monotone" dataKey="avgIV" stroke="hsl(38 92% 50%)" strokeWidth={1.5} strokeDasharray="5 5" dot={false} name="Avg IV" />
-                  </LineChart>
-                </ResponsiveContainer>
+                {ivSmileData.length === 0 ? (
+                  <div className="flex h-full items-center justify-center text-sm text-muted-foreground">
+                    IV smile unavailable for this chain. Broker response has no valid IV values.
+                  </div>
+                ) : (
+                  <ResponsiveContainer width="100%" height="100%">
+                    <LineChart data={ivSmileData}>
+                      <CartesianGrid strokeDasharray="3 3" stroke="hsl(var(--chart-grid))" />
+                      <XAxis dataKey="strike" tick={{ fontSize: 9, fill: "hsl(var(--muted-foreground))" }} />
+                      <YAxis tick={{ fontSize: 9, fill: "hsl(var(--muted-foreground))" }} domain={["auto", "auto"]} label={{ value: "IV %", angle: -90, position: "insideLeft", fill: "hsl(var(--muted-foreground))", fontSize: 10 }} />
+                      <Tooltip contentStyle={tooltipStyle} />
+                      <ReferenceLine x={Math.round(spotPrice / stepSize) * stepSize} stroke="hsl(210 100% 52%)" strokeDasharray="5 5" label={{ value: "ATM", fill: "hsl(210 100% 52%)", fontSize: 9 }} />
+                      <Line type="monotone" dataKey="callIV" stroke="hsl(142 71% 45%)" strokeWidth={2} dot={false} connectNulls name="Call IV" />
+                      <Line type="monotone" dataKey="putIV" stroke="hsl(0 84% 60%)" strokeWidth={2} dot={false} connectNulls name="Put IV" />
+                      <Line type="monotone" dataKey="avgIV" stroke="hsl(38 92% 50%)" strokeWidth={1.5} strokeDasharray="5 5" dot={false} name="Avg IV" />
+                    </LineChart>
+                  </ResponsiveContainer>
+                )}
               </div>
             </CardContent>
           </Card>

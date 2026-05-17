@@ -9,7 +9,7 @@ import {
   CommandList,
   CommandSeparator,
 } from "@/components/ui/command";
-import { LayoutDashboard, TableProperties, BarChart3, Calculator, Layers, Search, TrendingUp, TrendingDown, Keyboard } from "lucide-react";
+import { Activity, Briefcase, LayoutDashboard, TableProperties, BarChart3, Layers, Search, Star, TrendingUp, TrendingDown, Keyboard } from "lucide-react";
 import { useLiveIndices } from "@/hooks/useMarketData";
 
 // Static F&O stock list for command palette navigation (no prices needed)
@@ -44,8 +44,11 @@ export function CommandPalette({ open, onOpenChange }: CommandPaletteProps) {
           <CommandItem onSelect={() => go("/")}><LayoutDashboard className="mr-2 h-4 w-4" /> Dashboard <span className="ml-auto text-xs text-muted-foreground font-mono">Ctrl+1</span></CommandItem>
           <CommandItem onSelect={() => go("/option-chain")}><TableProperties className="mr-2 h-4 w-4" /> Option Chain <span className="ml-auto text-xs text-muted-foreground font-mono">Ctrl+2</span></CommandItem>
           <CommandItem onSelect={() => go("/oi-analysis")}><BarChart3 className="mr-2 h-4 w-4" /> OI Analysis <span className="ml-auto text-xs text-muted-foreground font-mono">Ctrl+3</span></CommandItem>
-          <CommandItem onSelect={() => go("/greeks")}><Calculator className="mr-2 h-4 w-4" /> Greeks Calculator <span className="ml-auto text-xs text-muted-foreground font-mono">Ctrl+4</span></CommandItem>
-          <CommandItem onSelect={() => go("/strategy")}><Layers className="mr-2 h-4 w-4" /> Strategy Builder <span className="ml-auto text-xs text-muted-foreground font-mono">Ctrl+5</span></CommandItem>
+          <CommandItem onSelect={() => go("/watchlist")}><Star className="mr-2 h-4 w-4" /> Watchlist <span className="ml-auto text-xs text-muted-foreground font-mono">Ctrl+4</span></CommandItem>
+          <CommandItem onSelect={() => go("/strategy-builder")}><Layers className="mr-2 h-4 w-4" /> Strategy Builder <span className="ml-auto text-xs text-muted-foreground font-mono">Ctrl+5</span></CommandItem>
+          <CommandItem onSelect={() => go("/position-tracker")}><Briefcase className="mr-2 h-4 w-4" /> Position Tracker <span className="ml-auto text-xs text-muted-foreground font-mono">Ctrl+6</span></CommandItem>
+          <CommandItem onSelect={() => go("/auto-rolling-straddle")}><Activity className="mr-2 h-4 w-4" /> Auto Rolling Straddle <span className="ml-auto text-xs text-muted-foreground font-mono">Ctrl+7</span></CommandItem>
+          <CommandItem onSelect={() => go("/vega-pulse")}><Activity className="mr-2 h-4 w-4" /> Vega Pulse <span className="ml-auto text-xs text-muted-foreground font-mono">Ctrl+8</span></CommandItem>
         </CommandGroup>
 
         <CommandSeparator />
@@ -83,7 +86,7 @@ export function CommandPalette({ open, onOpenChange }: CommandPaletteProps) {
         <CommandSeparator />
 
         <CommandGroup heading="Keyboard Shortcuts">
-          <CommandItem disabled><Keyboard className="mr-2 h-4 w-4" /> / — Search &nbsp;|&nbsp; G — Greeks &nbsp;|&nbsp; Ctrl+1-5 — Navigate &nbsp;|&nbsp; Esc — Close</CommandItem>
+          <CommandItem disabled><Keyboard className="mr-2 h-4 w-4" /> / — Search &nbsp;|&nbsp; Ctrl+1-8 — Navigate &nbsp;|&nbsp; Esc — Close</CommandItem>
         </CommandGroup>
       </CommandList>
     </CommandDialog>

@@ -93,9 +93,12 @@ export const BROKERS: BrokerInfo[] = [
     color: "hsl(173 58% 39%)",
     description: "Trishakti OI analytics source for refdata and historical open-interest time series.",
     docsUrl: "https://nubra.io/",
-    features: ["OI Time Series", "Refdata", "Index Data", "PCR"],
+    features: ["Auto Login", "Rolling IV", "OI Time Series", "Refdata", "PCR"],
     fields: [
-      { key: "sessionToken", label: "Session Token", placeholder: "Enter Nubra session token", type: "password", required: true },
+      { key: "phone", label: "Mobile Number", placeholder: "Enter Nubra mobile number", type: "text", required: false },
+      { key: "mpin", label: "MPIN", placeholder: "Enter Nubra MPIN", type: "password", required: false },
+      { key: "totpSecret", label: "TOTP Secret", placeholder: "Auto-generated after OTP setup", type: "password", required: false },
+      { key: "sessionToken", label: "Session Token", placeholder: "Auto-filled after login, or paste manually", type: "password", required: false },
       { key: "authToken", label: "Auth Token", placeholder: "Enter Nubra auth token", type: "password", required: false },
       { key: "deviceId", label: "Device ID", placeholder: "Enter Nubra device ID", type: "text", required: false },
       { key: "rawCookie", label: "Raw Cookie", placeholder: "Optional Nubra cookie", type: "password", required: false },
@@ -175,6 +178,77 @@ export function removeBrokerCredentials(brokerId: string): void {
 export function getActiveBroker(): BrokerCredentials | null {
   const all = getSavedBrokers();
   return all.find((b) => b.isActive) || all[0] || null;
+}
+
+export function getBrokerCredentials(brokerId: string): BrokerCredentials | null {
+  return getSavedBrokers().find((b) => b.brokerId === brokerId) || null;
+}
+
+export function syncBrokerRuntimeKeys(brokerId: string, values: Record<string, string>): void {
+  if (brokerId === "nubra") {
+    const sessionToken = values.sessionToken || values.session_token || "";
+    const authToken = values.authToken || values.auth_token || "";
+    const deviceId = values.deviceId || values.device_id || "";
+    const rawCookie = values.rawCookie || values.raw_cookie || "";
+    const phone = values.phone || "";
+    const mpin = values.mpin || "";
+    const totpSecret = values.totpSecret || values.totp_secret || "";
+
+    if (sessionToken) localStorage.setItem("nubra_session_token", sessionToken);
+    else localStorage.removeItem("nubra_session_token");
+
+    if (authToken) localStorage.setItem("nubra_auth_token", authToken);
+    else localStorage.removeItem("nubra_auth_token");
+
+    if (deviceId) localStorage.setItem("nubra_device_id", deviceId);
+    else localStorage.removeItem("nubra_device_id");
+
+    if (rawCookie) {
+      localStorage.setItem("nubra_raw_cookie", rawCookie);
+    } else if (sessionToken || authToken) {
+      localStorage.setItem("nubra_raw_cookie", `authToken=${authToken || sessionToken}; sessionToken=${sessionToken}`);
+    } else {
+      localStorage.removeItem("nubra_raw_cookie");
+    }
+
+    if (phone) localStorage.setItem("nubra_phone", phone);
+    else localStorage.removeItem("nubra_phone");
+    if (mpin) localStorage.setItem("nubra_mpin", mpin);
+    else localStorage.removeItem("nubra_mpin");
+    if (totpSecret) localStorage.setItem("nubra_totp_secret", totpSecret);
+    else localStorage.removeItem("nubra_totp_secret");
+  }
+
+  if (brokerId === "upstox") {
+    const accessToken = values.accessToken || values.access_token || "";
+    if (accessToken) localStorage.setItem("upstox_token", accessToken);
+    else localStorage.removeItem("upstox_token");
+  }
+}
+
+export function clearBrokerRuntimeKeys(brokerId: string): void {
+  if (brokerId === "nubra") {
+    localStorage.removeItem("nubra_session_token");
+    localStorage.removeItem("nubra_auth_token");
+    localStorage.removeItem("nubra_device_id");
+    localStorage.removeItem("nubra_raw_cookie");
+    localStorage.removeItem("nubra_login_date");
+    localStorage.removeItem("nubra_login_ts");
+    localStorage.removeItem("nubra_phone");
+    localStorage.removeItem("nubra_mpin");
+    localStorage.removeItem("nubra_totp_secret");
+  }
+  if (brokerId === "upstox") {
+    localStorage.removeItem("upstox_token");
+  }
+}
+
+export function syncSavedBrokerRuntimeKeys(): void {
+  for (const broker of getSavedBrokers()) {
+    if (broker.brokerId === "nubra" || broker.brokerId === "upstox") {
+      syncBrokerRuntimeKeys(broker.brokerId, broker.values);
+    }
+  }
 }
 
 export function setActiveBroker(brokerId: string): void {

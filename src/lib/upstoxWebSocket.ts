@@ -1,6 +1,6 @@
 import { Buffer } from "buffer";
 import * as protobuf from "protobufjs";
-import { getActiveBroker } from "./brokerConfig";
+import { getBrokerCredentials } from "./brokerConfig";
 
 const PROXY_BASE = import.meta.env.VITE_PROXY_URL || "http://localhost:4002";
 const PROXY_TOKEN = "__proxy__";
@@ -122,8 +122,7 @@ class UpstoxWebSocket {
   }
 
   private getToken() {
-    const broker = getActiveBroker();
-    return broker?.brokerId === "upstox" ? broker.values.accessToken || "" : "";
+    return getBrokerCredentials("upstox")?.values.accessToken || localStorage.getItem("upstox_token") || "";
   }
 
   private async initProtobuf() {

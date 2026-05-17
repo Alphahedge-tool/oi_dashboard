@@ -23,10 +23,18 @@ export function IVPercentileGauge({ chain, spotPrice, symbol }: Props) {
   // IV Skew data for smile chart
   const ivSkewData = useMemo(() => {
     const skew = getIVSkew(chain);
+    if (skew.length === 0) return [];
     // Filter to reasonable range around ATM (±20 strikes)
     const stepSize = chain.length > 1 ? Math.abs(chain[1].strikePrice - chain[0].strikePrice) : 50;
-    return skew.filter(d => Math.abs(d.strike - spotPrice) <= stepSize * 20);
-  }, [chain, spotPrice]);
+    const chainMidStrike = chain[Math.floor(chain.length / 2)]?.strikePrice || 0;
+    const centerStrike =
+      Number.isFinite(spotPrice) && spotPrice > 0
+        ? spotPrice
+        : atmData.atmStrike || chainMidStrike;
+    const filtered = skew.filter(d => !centerStrike || Math.abs(d.strike - centerStrike) <= stepSize * 20);
+
+    return filtered.length > 0 ? filtered : skew;
+  }, [chain, spotPrice, atmData.atmStrike]);
 
   // Current PCR from live chain
   const { pcrOI: currentPCR } = useMemo(() => calculatePCR(chain), [chain]);
@@ -44,6 +52,10 @@ export function IVPercentileGauge({ chain, spotPrice, symbol }: Props) {
   const ivZone = getIVZone(ivMetrics.percentile);
   const pcrSignal = currentPCR > 1.2 ? "Bullish" : currentPCR < 0.7 ? "Bearish" : "Neutral";
   const pcrColor = currentPCR > 1.2 ? "text-bullish" : currentPCR < 0.7 ? "text-bearish" : "text-warning";
+  const strikeStep = chain.length > 1 ? Math.abs(chain[1].strikePrice - chain[0].strikePrice) : 50;
+  const chartCenterStrike =
+    atmData.atmStrike ||
+    (Number.isFinite(spotPrice) && spotPrice > 0 ? Math.round(spotPrice / strikeStep) * strikeStep : 0);
 
   if (chain.length === 0) {
     return (
@@ -142,10 +154,12 @@ export function IVPercentileGauge({ chain, spotPrice, symbol }: Props) {
                     <CartesianGrid strokeDasharray="3 3" stroke="hsl(var(--chart-grid))" />
                     <XAxis dataKey="strike" tick={{ fontSize: 8, fill: "hsl(var(--muted-foreground))" }} />
                     <YAxis tick={{ fontSize: 9, fill: "hsl(var(--muted-foreground))" }} domain={["dataMin - 2", "dataMax + 2"]} />
-                    <Tooltip contentStyle={tooltipStyle} formatter={(v: number) => [`${v.toFixed(1)}%`, ""]} />
-                    <ReferenceLine x={Math.round(spotPrice / (chain.length > 1 ? Math.abs(chain[1].strikePrice - chain[0].strikePrice) : 50)) * (chain.length > 1 ? Math.abs(chain[1].strikePrice - chain[0].strikePrice) : 50)} stroke="hsl(var(--primary))" strokeDasharray="3 3" label={{ value: "ATM", fill: "hsl(var(--primary))", fontSize: 9, position: "top" }} />
-                    <Line type="monotone" dataKey="callIV" stroke="hsl(142 71% 45%)" strokeWidth={2} dot={false} name="Call IV" />
-                    <Line type="monotone" dataKey="putIV" stroke="hsl(0 84% 60%)" strokeWidth={2} dot={false} name="Put IV" />
+                    <Tooltip contentStyle={tooltipStyle} formatter={(v: number | null) => [v === null ? "-" : `${Number(v).toFixed(1)}%`, ""]} />
+                    {chartCenterStrike > 0 && (
+                      <ReferenceLine x={chartCenterStrike} stroke="hsl(var(--primary))" strokeDasharray="3 3" label={{ value: "ATM", fill: "hsl(var(--primary))", fontSize: 9, position: "top" }} />
+                    )}
+                    <Line type="monotone" dataKey="callIV" stroke="hsl(142 71% 45%)" strokeWidth={2} dot={false} connectNulls name="Call IV" />
+                    <Line type="monotone" dataKey="putIV" stroke="hsl(0 84% 60%)" strokeWidth={2} dot={false} connectNulls name="Put IV" />
                     <Area type="monotone" dataKey="avgIV" stroke="hsl(var(--primary))" fill="url(#ivSmileGrad)" strokeWidth={1.5} strokeDasharray="5 5" dot={false} name="Avg IV" />
                   </AreaChart>
                 </ResponsiveContainer>

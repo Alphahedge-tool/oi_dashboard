@@ -66,7 +66,7 @@ export interface DatabaseMetadata {
 
 // ── IndexedDB Manager ──
 
-const DB_NAME = "mrchartist_market_db";
+const DB_NAME = "trishakti_market_db";
 const DB_VERSION = 2;
 
 let dbInstance: IDBDatabase | null = null;

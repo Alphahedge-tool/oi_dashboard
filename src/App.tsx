@@ -15,6 +15,8 @@ const OIAnalysis = lazy(() => import("./pages/OIAnalysis"));
 const Watchlist = lazy(() => import("./pages/Watchlist"));
 const StrategyBuilder = lazy(() => import("./pages/StrategyBuilder"));
 const PositionTracker = lazy(() => import("./pages/PositionTracker"));
+const AutoRollingStraddle = lazy(() => import("./pages/AutoRollingStraddle"));
+const VegaPulsePage = lazy(() => import("./pages/VegaPulsePage"));
 const BrokerSettings = lazy(() => import("./pages/BrokerSettings"));
 const NotFound = lazy(() => import("./pages/NotFound"));
 
@@ -44,6 +46,8 @@ const App = () => (
             <Route path="/watchlist" element={<PageSuspense><Watchlist /></PageSuspense>} />
             <Route path="/strategy-builder" element={<PageSuspense><StrategyBuilder /></PageSuspense>} />
             <Route path="/position-tracker" element={<PageSuspense><PositionTracker /></PageSuspense>} />
+            <Route path="/auto-rolling-straddle" element={<PageSuspense><AutoRollingStraddle /></PageSuspense>} />
+            <Route path="/vega-pulse" element={<PageSuspense><VegaPulsePage /></PageSuspense>} />
             <Route path="/broker-settings" element={<PageSuspense><BrokerSettings /></PageSuspense>} />
           </Route>
           <Route path="*" element={<Suspense fallback={null}><NotFound /></Suspense>} />

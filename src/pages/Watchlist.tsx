@@ -5,7 +5,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Progress } from "@/components/ui/progress";
-import { useFnOStocks, useLiveIndices } from "@/hooks/useMarketData";
+import { useFnOStocks, useLiveIndices, useUpstoxSymbols } from "@/hooks/useMarketData";
 import { useWebSocketStatus } from "@/hooks/useWebSocket";
 import { useNavigate } from "react-router-dom";
 import { Search, Star, TrendingUp, TrendingDown, ExternalLink, Radio, Loader2, Plus, X, BarChart3 } from "lucide-react";
@@ -35,6 +35,7 @@ export default function Watchlist() {
   const [addSymbol, setAddSymbol] = useState("");
   const { data: fnoData, isLoading } = useFnOStocks();
   const { data: indicesResult } = useLiveIndices();
+  const { data: upstoxSymbols = [] } = useUpstoxSymbols(addSymbol, 80);
   const wsConnected = useWebSocketStatus();
   const [chartSymbol, setChartSymbol] = useState<string | null>(null);
 
@@ -103,11 +104,16 @@ export default function Watchlist() {
 
   // All available F&O symbols for autocomplete
   const availableSymbols = useMemo(() => {
-    return allStocks
+    const apiSymbols = upstoxSymbols
+      .map((s) => s.tradingSymbol || s.symbol)
+      .filter(Boolean);
+    const liveSymbols = allStocks
       .map((s) => s.symbol)
+      .filter(Boolean);
+    return Array.from(new Set([...apiSymbols, ...liveSymbols]))
       .filter((sym) => !watchedSymbols.includes(sym))
       .sort();
-  }, [allStocks, watchedSymbols]);
+  }, [allStocks, upstoxSymbols, watchedSymbols]);
 
   const addToWatchlist = () => {
     const sym = addSymbol.toUpperCase().trim();

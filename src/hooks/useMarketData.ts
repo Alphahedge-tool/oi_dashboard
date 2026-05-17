@@ -1,6 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
-import { fetchLiveOptionChain, fetchLiveIndices, fetchMarketStatus, fetchExpiryList, fetchAllIndices, fetchLiveFnOStocks, fetchProxyHealth } from "@/lib/marketApi";
-import type { FnOStockData } from "@/lib/marketApi";
+import { fetchLiveOptionChain, fetchLiveIndices, fetchMarketStatus, fetchExpiryList, fetchAllIndices, fetchLiveFnOStocks, fetchProxyHealth, fetchUpstoxInstruments } from "@/lib/marketApi";
+import type { FnOStockData, UpstoxInstrument } from "@/lib/marketApi";
 import { getMaxPain } from "@/lib/oiUtils";
 import { getLotSize } from "@/lib/positionStore";
 import type { OptionData, IndexData, ExpiryDate } from "@/lib/mockData";
@@ -348,6 +348,34 @@ export function useFnOStocks() {
     },
     refetchInterval: (query) => query.state.data?.isLive ? 30000 : 120000,
     staleTime: 15000,
+    retry: 1,
+  });
+}
+
+// ── Hook: Upstox Instrument Master Symbols ──
+// Mirrors Trishakti's API-backed symbol universe for search/autocomplete.
+export function useUpstoxSymbols(query = "", limit = 250) {
+  return useQuery({
+    queryKey: ["upstox-symbols", query, limit],
+    queryFn: async () => {
+      if (!shouldTryProxy()) return [] as UpstoxInstrument[];
+      try {
+        const instruments = await fetchUpstoxInstruments({
+          mode: "underlyings",
+          q: query.trim(),
+          limit,
+        });
+        if (instruments.length > 0) markProxyOnline();
+        return instruments;
+      } catch (e) {
+        markProxyOffline();
+        console.warn("Upstox instruments fetch failed:", e);
+        return [] as UpstoxInstrument[];
+      }
+    },
+    enabled: query.trim().length === 0 || query.trim().length >= 1,
+    staleTime: 12 * 60 * 60 * 1000,
+    gcTime: 12 * 60 * 60 * 1000,
     retry: 1,
   });
 }
