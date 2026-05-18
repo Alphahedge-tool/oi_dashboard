@@ -1,6 +1,6 @@
-import { lazy, Suspense } from "react";
+import { lazy, Suspense, useEffect, useState } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { BrowserRouter, Route, Routes } from "react-router-dom";
+import { BrowserRouter, Route, Routes, useLocation } from "react-router-dom";
 import { Toaster as Sonner } from "@/components/ui/sonner";
 import { Toaster } from "@/components/ui/toaster";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -32,6 +32,35 @@ function PageSuspense({ children }: { children: React.ReactNode }) {
   );
 }
 
+function LiveToolsKeepAlive() {
+  const { pathname } = useLocation();
+  const showAuto = pathname === "/auto-rolling-straddle";
+  const showVega = pathname === "/vega-pulse";
+  const [visited, setVisited] = useState({ auto: showAuto, vega: showVega });
+
+  useEffect(() => {
+    setVisited((prev) => ({
+      auto: prev.auto || showAuto,
+      vega: prev.vega || showVega,
+    }));
+  }, [showAuto, showVega]);
+
+  return (
+    <>
+      {visited.auto && (
+        <div className={showAuto ? "block" : "hidden"} aria-hidden={!showAuto}>
+          <PageSuspense><AutoRollingStraddle /></PageSuspense>
+        </div>
+      )}
+      {visited.vega && (
+        <div className={showVega ? "block" : "hidden"} aria-hidden={!showVega}>
+          <PageSuspense><VegaPulsePage /></PageSuspense>
+        </div>
+      )}
+    </>
+  );
+}
+
 const App = () => (
   <QueryClientProvider client={queryClient}>
     <TooltipProvider>
@@ -46,8 +75,8 @@ const App = () => (
             <Route path="/watchlist" element={<PageSuspense><Watchlist /></PageSuspense>} />
             <Route path="/strategy-builder" element={<PageSuspense><StrategyBuilder /></PageSuspense>} />
             <Route path="/position-tracker" element={<PageSuspense><PositionTracker /></PageSuspense>} />
-            <Route path="/auto-rolling-straddle" element={<PageSuspense><AutoRollingStraddle /></PageSuspense>} />
-            <Route path="/vega-pulse" element={<PageSuspense><VegaPulsePage /></PageSuspense>} />
+            <Route path="/auto-rolling-straddle" element={<LiveToolsKeepAlive />} />
+            <Route path="/vega-pulse" element={<LiveToolsKeepAlive />} />
             <Route path="/broker-settings" element={<PageSuspense><BrokerSettings /></PageSuspense>} />
           </Route>
           <Route path="*" element={<Suspense fallback={null}><NotFound /></Suspense>} />

@@ -5,6 +5,7 @@ import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { useLiveOptionChain, useUpstoxSymbols } from "@/hooks/useMarketData";
 import { getBrokerCredentials, syncBrokerRuntimeKeys } from "@/lib/brokerConfig";
+import { upstoxWS, type UpstoxTick } from "@/lib/upstoxWebSocket";
 
 type IntervalOpt = { label: string; min: number; upstox: string };
 type Candle = { time: number; open: number; high: number; low: number; close: number; volume: number };
@@ -29,8 +30,31 @@ type LoadedContext = {
   ivData: LineData[];
   pointCount: number;
 };
+type NubraWsStatus = "idle" | "connecting" | "live" | "missing-token" | "closed" | "error";
+type NubraOptionItem = {
+  strike_price?: number | null;
+  last_traded_price?: number | null;
+  iv?: number | null;
+  volume?: number | null;
+};
+type NubraOptionSnapshot = {
+  ce: Map<number, NubraOptionItem>;
+  pe: Map<number, NubraOptionItem>;
+  currentPrice: number;
+};
+type LiveLegLtp = { ce: number; pe: number; ceIv: number; peIv: number; ceAt: number; peAt: number };
+type LiveAnimatedSeries = "premium" | "rollingIv";
+type LiveAnimation = {
+  time: Time;
+  from: number;
+  target: number;
+  displayed: number;
+  startedAt: number;
+  duration: number;
+};
 
 const PROXY_BASE = import.meta.env.VITE_PROXY_URL || "http://localhost:4002";
+const NUBRA_BRIDGE_URL = import.meta.env.VITE_NUBRA_BRIDGE_URL || "ws://localhost:8765";
 const IST_OFFSET_SEC = 5.5 * 60 * 60;
 
 const INTERVALS: IntervalOpt[] = [
@@ -52,7 +76,7 @@ const INDEX_KEYS: Record<string, string> = {
 const BSE_SYMBOLS = new Set(["SENSEX", "BANKEX"]);
 
 const SERIES_META: Record<SeriesKey, { label: string; color: string }> = {
-  premium: { label: "Lowest Straddle Premium", color: "#facc15" },
+  premium: { label: "ATM Straddle Premium", color: "#facc15" },
   premiumVwap: { label: "Premium VWAP", color: "#a3e635" },
   rollingIv: { label: "Rolling IV %", color: "#fb7185" },
   spot: { label: "Spot", color: "#5b74ff" },
@@ -73,6 +97,15 @@ const DEFAULT_VISIBLE: Record<SeriesKey, boolean> = {
   spotAtmSyntheticFut: true,
   ce: true,
   pe: true,
+};
+
+const NUBRA_WS_LABEL: Record<NubraWsStatus, string> = {
+  idle: "Nubra WS idle",
+  connecting: "Nubra WS connecting",
+  live: "Nubra WS live",
+  "missing-token": "Nubra token missing",
+  closed: "Nubra WS reconnecting",
+  error: "Nubra WS error",
 };
 
 const ATM_STRADDLE_WING = 5;
@@ -107,6 +140,13 @@ function formatIstTick(time: Time) {
   return formatIstTime(time, isOpenTick);
 }
 
+function formatTickAge(ts: number | null) {
+  if (!ts) return "";
+  const seconds = Math.max(0, Math.floor((Date.now() - ts) / 1000));
+  if (seconds < 60) return `${seconds}s`;
+  return `${Math.floor(seconds / 60)}m`;
+}
+
 function cssHslVar(name: string, alpha?: number) {
   const value = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
   return `hsl(${value}${alpha == null ? "" : ` / ${alpha}`})`;
@@ -122,6 +162,14 @@ function toNubraChainValue(underlying: string, expiry: string) {
   const mm = d.toLocaleString("en-IN", { month: "2-digit", timeZone: "Asia/Kolkata" });
   const dd = d.toLocaleString("en-IN", { day: "2-digit", timeZone: "Asia/Kolkata" });
   return `${normalizeSymbol(underlying)}_${yyyy}${mm}${dd}`;
+}
+
+function toNubraExpiryValue(expiry: string) {
+  const d = new Date(`${expiry}T00:00:00+05:30`);
+  const yyyy = d.toLocaleString("en-IN", { year: "numeric", timeZone: "Asia/Kolkata" });
+  const mm = d.toLocaleString("en-IN", { month: "2-digit", timeZone: "Asia/Kolkata" });
+  const dd = d.toLocaleString("en-IN", { day: "2-digit", timeZone: "Asia/Kolkata" });
+  return `${yyyy}${mm}${dd}`;
 }
 
 function lastTradingDay() {
@@ -389,31 +437,19 @@ async function fetchPublicCandles(instrumentKey: string, interval: IntervalOpt):
   return fetchCandlePage(instrumentKey, interval, Number(first.prev));
 }
 
-function pickLowestStraddleLeg(strikes: number[], byStrike: Map<number, LegCandles>, spot: number, time: number) {
+function pickAtmStraddleLeg(strikes: number[], byStrike: Map<number, LegCandles>, spot: number, time: number) {
   const centerIndex = nearestStrikeIndex(strikes, spot);
   if (centerIndex < 0) return null;
 
-  const from = Math.max(0, centerIndex - ATM_STRADDLE_WING);
-  const to = Math.min(strikes.length - 1, centerIndex + ATM_STRADDLE_WING);
-  let best: { leg: LegCandles; ceBar: Candle; peBar: Candle; premium: number; distance: number } | null = null;
+  const leg = byStrike.get(strikes[centerIndex]);
+  if (!leg) return null;
+  const ceBar = candleAtOrBefore(leg.ce, time);
+  const peBar = candleAtOrBefore(leg.pe, time);
+  const ceClose = ceBar?.close || 0;
+  const peClose = peBar?.close || 0;
+  if (!ceBar || !peBar || ceClose <= 0 || peClose <= 0) return null;
 
-  for (let i = from; i <= to; i += 1) {
-    const leg = byStrike.get(strikes[i]);
-    if (!leg) continue;
-    const ceBar = candleAtOrBefore(leg.ce, time);
-    const peBar = candleAtOrBefore(leg.pe, time);
-    const ceClose = ceBar?.close || 0;
-    const peClose = peBar?.close || 0;
-    if (!ceBar || !peBar || ceClose <= 0 || peClose <= 0) continue;
-
-    const premium = ceClose + peClose;
-    const distance = Math.abs(leg.strike - spot);
-    if (!best || premium < best.premium || (premium === best.premium && distance < best.distance)) {
-      best = { leg, ceBar, peBar, premium, distance };
-    }
-  }
-
-  return best;
+  return { leg, ceBar, peBar, premium: ceClose + peClose };
 }
 
 function buildRollingSeries(spotCandles: Candle[], legs: LegCandles[]) {
@@ -444,7 +480,7 @@ function buildRollingSeries(spotCandles: Candle[], legs: LegCandles[]) {
       }
     }
 
-    const selected = pickLowestStraddleLeg(strikes, byStrike, bar.close, bar.time);
+    const selected = pickAtmStraddleLeg(strikes, byStrike, bar.close, bar.time);
     if (!selected) continue;
     const { leg, ceBar, peBar, premium: straddlePremium } = selected;
     const ceClose = ceBar.close;
@@ -468,6 +504,150 @@ function buildRollingSeries(spotCandles: Candle[], legs: LegCandles[]) {
   }
 
   return { premium, premiumVwap: buildPremiumVwap(premium), rollingIv, spot, strike, syntheticFut, spotAtmSyntheticFut, ce, pe };
+}
+
+function toIntervalTime(ms: number, intervalMinutes: number) {
+  const bucketMs = Math.max(1, intervalMinutes) * 60_000;
+  return Math.floor(ms / bucketMs) * bucketMs / 1000;
+}
+
+function upsertLinePoint<T extends LineData>(points: T[], point: T): T[] {
+  const pointTime = Number(point.time);
+  const next = points.filter((item) => Number(item.time) !== pointTime);
+  next.push(point);
+  next.sort((a, b) => Number(a.time) - Number(b.time));
+  return next;
+}
+
+function patchLastPoint<T extends LineData>(points: T[], point: T): T[] {
+  const last = points[points.length - 1];
+  const pointTime = Number(point.time);
+  if (last && Number(last.time) === pointTime) {
+    points[points.length - 1] = point;
+    return points;
+  }
+  if (!last || Number(last.time) < pointTime) {
+    points.push(point);
+    return points;
+  }
+  return upsertLinePoint(points, point);
+}
+
+function itemPrice(item?: NubraOptionItem) {
+  const price = Number(item?.last_traded_price);
+  return Number.isFinite(price) && price > 0 ? price : 0;
+}
+
+function indexByStrike(items: NubraOptionItem[]) {
+  const byStrike = new Map<number, NubraOptionItem>();
+  for (const item of items) {
+    const strike = Number(item?.strike_price);
+    if (Number.isFinite(strike)) byStrike.set(Math.round(strike), item);
+  }
+  return byStrike;
+}
+
+function mergeOptionSnapshot(snapshot: NubraOptionSnapshot, payload: { ce?: NubraOptionItem[]; pe?: NubraOptionItem[]; current_price?: number | null }) {
+  for (const item of payload.ce || []) {
+    const strike = Number(item?.strike_price);
+    if (Number.isFinite(strike)) snapshot.ce.set(Math.round(strike), { ...snapshot.ce.get(Math.round(strike)), ...item });
+  }
+  for (const item of payload.pe || []) {
+    const strike = Number(item?.strike_price);
+    if (Number.isFinite(strike)) snapshot.pe.set(Math.round(strike), { ...snapshot.pe.get(Math.round(strike)), ...item });
+  }
+  const currentPrice = Number(payload.current_price);
+  if (Number.isFinite(currentPrice) && currentPrice > 0) snapshot.currentPrice = currentPrice;
+}
+
+function buildLiveRollingPoint(
+  context: LoadedContext,
+  snapshot: NubraOptionSnapshot,
+  intervalMinutes: number,
+): ReturnType<typeof buildRollingSeries> | null {
+  const spotValue = Number(snapshot.currentPrice || context.spotCandles.at(-1)?.close || 0);
+  if (!Number.isFinite(spotValue) || spotValue <= 0) return null;
+
+  const strikes = context.legs.map((leg) => leg.strike).sort((a, b) => a - b);
+  const centerIndex = nearestStrikeIndex(strikes, spotValue);
+  if (centerIndex < 0) return null;
+  const strike = strikes[centerIndex];
+  const ce = snapshot.ce.get(Math.round(strike));
+  const pe = snapshot.pe.get(Math.round(strike));
+  const ceClose = itemPrice(ce);
+  const peClose = itemPrice(pe);
+  if (!ce || !pe || ceClose <= 0 || peClose <= 0) return null;
+
+  const spotAtm = nearestStrike(strikes, spotValue);
+  const spotAtmCe = spotAtm == null ? undefined : snapshot.ce.get(Math.round(spotAtm));
+  const spotAtmPe = spotAtm == null ? undefined : snapshot.pe.get(Math.round(spotAtm));
+  const time = toIntervalTime(Date.now(), intervalMinutes) as Time;
+  const rollingIv = averagePositive([Number(ce.iv || 0), Number(pe.iv || 0)]);
+  const premiumPoint: PremiumPoint = {
+    time,
+    value: ceClose + peClose,
+    ceTypical: ceClose,
+    peTypical: peClose,
+    ceVolume: Number(ce.volume || 0),
+    peVolume: Number(pe.volume || 0),
+  };
+
+  return {
+    premium: [premiumPoint],
+    premiumVwap: [premiumPoint],
+    rollingIv: rollingIv > 0 ? [{ time, value: rollingIv }] : [],
+    spot: [{ time, value: spotValue }],
+    strike: [{ time, value: strike }],
+    syntheticFut: [{ time, value: strike + ceClose - peClose }],
+    spotAtmSyntheticFut: spotAtm != null && itemPrice(spotAtmCe) > 0 && itemPrice(spotAtmPe) > 0
+      ? [{ time, value: spotAtm + itemPrice(spotAtmCe) - itemPrice(spotAtmPe) }]
+      : [],
+    ce: [{ time, value: ceClose }],
+    pe: [{ time, value: peClose }],
+  };
+}
+
+function buildUpstoxLiveRollingPoint(
+  context: LoadedContext,
+  spotValue: number,
+  ltpByStrike: Map<number, LiveLegLtp>,
+  intervalMinutes: number,
+): ReturnType<typeof buildRollingSeries> | null {
+  if (!Number.isFinite(spotValue) || spotValue <= 0) return null;
+  const strikes = context.legs.map((leg) => leg.strike).sort((a, b) => a - b);
+  const strike = nearestStrike(strikes, spotValue);
+  if (strike == null) return null;
+  const ltp = ltpByStrike.get(strike);
+  if (!ltp || ltp.ce <= 0 || ltp.pe <= 0) return null;
+  const now = Date.now();
+  if (Math.abs(ltp.ceAt - ltp.peAt) > 2500 || now - Math.min(ltp.ceAt, ltp.peAt) > 5000) return null;
+
+  const spotAtm = nearestStrike(strikes, spotValue);
+  const spotAtmLtp = spotAtm == null ? undefined : ltpByStrike.get(spotAtm);
+  const time = toIntervalTime(Date.now(), intervalMinutes) as Time;
+  const premiumPoint: PremiumPoint = {
+    time,
+    value: ltp.ce + ltp.pe,
+    ceTypical: ltp.ce,
+    peTypical: ltp.pe,
+    ceVolume: 0,
+    peVolume: 0,
+  };
+  const rollingIv = averagePositive([ltp.ceIv, ltp.peIv]);
+
+  return {
+    premium: [premiumPoint],
+    premiumVwap: [premiumPoint],
+    rollingIv: rollingIv > 0 ? [{ time, value: rollingIv }] : [],
+    spot: [{ time, value: spotValue }],
+    strike: [{ time, value: strike }],
+    syntheticFut: [{ time, value: strike + ltp.ce - ltp.pe }],
+    spotAtmSyntheticFut: spotAtm != null && spotAtmLtp && spotAtmLtp.ce > 0 && spotAtmLtp.pe > 0
+      ? [{ time, value: spotAtm + spotAtmLtp.ce - spotAtmLtp.pe }]
+      : [],
+    ce: [{ time, value: ltp.ce }],
+    pe: [{ time, value: ltp.pe }],
+  };
 }
 
 function sessionStartTimes(series: LineData[]) {
@@ -494,10 +674,29 @@ export default function AutoRollingStraddle() {
   const chartRef = useRef<IChartApi | null>(null);
   const seriesRef = useRef<Partial<Record<SeriesKey, ISeriesApi<"Line">>>>({});
   const daySeparatorTimesRef = useRef<Time[]>([]);
+  const plottedDataRef = useRef<ReturnType<typeof buildRollingSeries> | null>(null);
+  const nubraSnapshotRef = useRef<NubraOptionSnapshot>({ ce: new Map(), pe: new Map(), currentPrice: 0 });
+  const liveSpotRef = useRef(0);
+  const liveLtpByStrikeRef = useRef<Map<number, LiveLegLtp>>(new Map());
+  const upstoxUnsubsRef = useRef<Array<() => void>>([]);
+  const upstoxKeysRef = useRef<string[]>([]);
+  const lastUpstoxTickRef = useRef<number | null>(null);
+  const lastSummaryPaintRef = useRef(0);
+  const lastTickBadgePaintRef = useRef(0);
+  const liveStrikeRef = useRef<number | null>(null);
+  const pendingLiveRef = useRef<ReturnType<typeof buildRollingSeries> | null>(null);
+  const liveFrameRef = useRef<number | null>(null);
+  const liveAnimationRef = useRef<{ frame: number; premium: LiveAnimation | null; rollingIv: LiveAnimation | null }>({
+    frame: 0,
+    premium: null,
+    rollingIv: null,
+  });
   const loadedRef = useRef<LoadedContext | null>(null);
   const loadingPreviousRef = useRef(false);
   const loadedFromRef = useRef<Set<number>>(new Set());
   const visibleRef = useRef(DEFAULT_VISIBLE);
+  const nubraWsRef = useRef<WebSocket | null>(null);
+  const nubraReconnectRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [symbol, setSymbol] = useState("NIFTY");
   const [search, setSearch] = useState("");
   const [selectedExpiry, setSelectedExpiry] = useState<string | undefined>();
@@ -506,6 +705,9 @@ export default function AutoRollingStraddle() {
   const [loadingPrevious, setLoadingPrevious] = useState(false);
   const [error, setError] = useState("");
   const [summary, setSummary] = useState({ atm: 0, premium: 0, iv: 0, ivSource: "", changePct: 0, points: 0 });
+  const [nubraWsStatus, setNubraWsStatus] = useState<NubraWsStatus>("idle");
+  const [lastNubraTick, setLastNubraTick] = useState<number | null>(null);
+  const [lastUpstoxTick, setLastUpstoxTick] = useState<number | null>(null);
   const [visible, setVisible] = useState(DEFAULT_VISIBLE);
   const [daySeparatorCoords, setDaySeparatorCoords] = useState<{ x: number; label: string }[]>([]);
   const [tooltip, setTooltip] = useState<ChartTooltip | null>(null);
@@ -639,6 +841,7 @@ export default function AutoRollingStraddle() {
   ) => {
     const chart = chartRef.current;
     if (!chart) return;
+    plottedDataRef.current = { ...data, rollingIv };
     const range = preserveRange ? chart.timeScale().getVisibleLogicalRange() : null;
     seriesRef.current.premium?.setData(data.premium);
     seriesRef.current.premiumVwap?.setData(data.premiumVwap);
@@ -670,6 +873,330 @@ export default function AutoRollingStraddle() {
       points: data.premium.length,
     });
   }, [updateDaySeparators]);
+
+  const stopLiveAnimation = useCallback(() => {
+    const frame = liveAnimationRef.current.frame;
+    if (frame) window.cancelAnimationFrame(frame);
+    liveAnimationRef.current = { frame: 0, premium: null, rollingIv: null };
+  }, []);
+
+  const tickLiveAnimation = useCallback(() => {
+    const animations = liveAnimationRef.current;
+    const now = performance.now();
+    let active = false;
+
+    (["premium", "rollingIv"] as LiveAnimatedSeries[]).forEach((key) => {
+      const animation = animations[key];
+      const series = seriesRef.current[key];
+      if (!animation || !series) return;
+      const progress = Math.min((now - animation.startedAt) / animation.duration, 1);
+      const eased = 1 - (1 - progress) ** 3;
+      const value = animation.from + (animation.target - animation.from) * eased;
+      series.update({ time: animation.time, value });
+      animations[key] = { ...animation, displayed: value };
+      if (progress < 1) active = true;
+    });
+
+    animations.frame = active ? window.requestAnimationFrame(tickLiveAnimation) : 0;
+  }, []);
+
+  const animateLiveSeries = useCallback((key: LiveAnimatedSeries, point: LineData) => {
+    const series = seriesRef.current[key];
+    const target = Number(point.value);
+    if (!series || !Number.isFinite(target) || target <= 0) return;
+
+    const animations = liveAnimationRef.current;
+    const previous = animations[key];
+    const from = previous?.displayed ?? previous?.target ?? target;
+    animations[key] = {
+      time: point.time,
+      from,
+      target,
+      displayed: from,
+      startedAt: performance.now(),
+      duration: 700,
+    };
+
+    if (!animations.frame) animations.frame = window.requestAnimationFrame(tickLiveAnimation);
+  }, [tickLiveAnimation]);
+
+  const resetAnimatedSeries = useCallback((key: LiveAnimatedSeries) => {
+    liveAnimationRef.current[key] = null;
+  }, []);
+
+  const flushLivePoint = useCallback((live: ReturnType<typeof buildRollingSeries>) => {
+    const chart = chartRef.current;
+    const current = plottedDataRef.current;
+    if (!chart || !current || !live.premium.length) return;
+    const previousLastTime = Number(current.premium.at(-1)?.time || 0);
+    const liveTime = Number(live.premium[0].time);
+    const isNewInterval = liveTime > previousLastTime;
+    const nextStrike = Number(live.strike[0]?.value || 0);
+    const strikeChanged = Number.isFinite(nextStrike) && liveStrikeRef.current != null && liveStrikeRef.current !== nextStrike;
+    if (Number.isFinite(nextStrike) && nextStrike > 0) liveStrikeRef.current = nextStrike;
+
+    patchLastPoint(current.premium, live.premium[0]);
+    if (live.rollingIv[0]) patchLastPoint(current.rollingIv, live.rollingIv[0]);
+    patchLastPoint(current.spot, live.spot[0]);
+    patchLastPoint(current.strike, live.strike[0]);
+    patchLastPoint(current.syntheticFut, live.syntheticFut[0]);
+    if (live.spotAtmSyntheticFut[0]) patchLastPoint(current.spotAtmSyntheticFut, live.spotAtmSyntheticFut[0]);
+    patchLastPoint(current.ce, live.ce[0]);
+    patchLastPoint(current.pe, live.pe[0]);
+
+    let lastVwap = current.premiumVwap.at(-1);
+    if (isNewInterval) {
+      current.premiumVwap = buildPremiumVwap(current.premium);
+      lastVwap = current.premiumVwap.at(-1);
+    }
+    plottedDataRef.current = current;
+    loadedRef.current = loadedRef.current
+      ? { ...loadedRef.current, ivData: current.rollingIv, pointCount: current.premium.length }
+      : loadedRef.current;
+
+    if (strikeChanged) {
+      resetAnimatedSeries("premium");
+      seriesRef.current.premium?.update(live.premium[0]);
+    } else {
+      animateLiveSeries("premium", live.premium[0]);
+    }
+    if (lastVwap) seriesRef.current.premiumVwap?.update(lastVwap);
+    if (live.rollingIv[0]) animateLiveSeries("rollingIv", live.rollingIv[0]);
+    seriesRef.current.spot?.update(live.spot[0]);
+    seriesRef.current.strike?.update(live.strike[0]);
+    seriesRef.current.syntheticFut?.update(live.syntheticFut[0]);
+    if (live.spotAtmSyntheticFut[0]) seriesRef.current.spotAtmSyntheticFut?.update(live.spotAtmSyntheticFut[0]);
+    seriesRef.current.ce?.update(live.ce[0]);
+    seriesRef.current.pe?.update(live.pe[0]);
+
+    if (isNewInterval) {
+      daySeparatorTimesRef.current = sessionStartTimes(current.premium);
+      requestAnimationFrame(updateDaySeparators);
+      chart.timeScale().scrollToRealTime();
+    }
+
+    const now = Date.now();
+    if (isNewInterval || now - lastSummaryPaintRef.current > 750) {
+      lastSummaryPaintRef.current = now;
+      const firstPremium = current.premium[0]?.value || 0;
+      const lastPremium = current.premium.at(-1)?.value || 0;
+      setSummary({
+        atm: current.strike.at(-1)?.value || 0,
+        premium: lastPremium,
+        iv: current.rollingIv.at(-1)?.value || 0,
+        ivSource: live.rollingIv.length ? "Nubra WS" : "Nubra",
+        changePct: firstPremium ? ((lastPremium - firstPremium) / firstPremium) * 100 : 0,
+        points: current.premium.length,
+      });
+    }
+  }, [animateLiveSeries, resetAnimatedSeries, updateDaySeparators]);
+
+  const appendLivePoint = useCallback((live: ReturnType<typeof buildRollingSeries>) => {
+    pendingLiveRef.current = live;
+    if (liveFrameRef.current != null) return;
+    liveFrameRef.current = window.requestAnimationFrame(() => {
+      liveFrameRef.current = null;
+      const next = pendingLiveRef.current;
+      pendingLiveRef.current = null;
+      if (next) flushLivePoint(next);
+    });
+  }, [flushLivePoint]);
+
+  const appendLiveIvPoint = useCallback((point: LineData) => {
+    const current = plottedDataRef.current;
+    if (!current || !seriesRef.current.rollingIv) return;
+    patchLastPoint(current.rollingIv, point);
+    plottedDataRef.current = current;
+    loadedRef.current = loadedRef.current ? { ...loadedRef.current, ivData: current.rollingIv } : loadedRef.current;
+    try {
+      animateLiveSeries("rollingIv", point);
+    } catch {
+      seriesRef.current.rollingIv.setData(current.rollingIv);
+    }
+    const now = Date.now();
+    if (now - lastSummaryPaintRef.current > 750) {
+      lastSummaryPaintRef.current = now;
+      setSummary((prev) => ({ ...prev, iv: point.value, ivSource: "Nubra WS" }));
+    }
+  }, [animateLiveSeries]);
+
+  const applyUpstoxLive = useCallback(() => {
+    const context = loadedRef.current;
+    if (!context) return;
+    const live = buildUpstoxLiveRollingPoint(context, liveSpotRef.current, liveLtpByStrikeRef.current, interval.min);
+    if (!live) return;
+    const now = Date.now();
+    lastUpstoxTickRef.current = now;
+    if (now - lastTickBadgePaintRef.current > 1000) {
+      lastTickBadgePaintRef.current = now;
+      setLastUpstoxTick(now);
+    }
+    appendLivePoint(live);
+  }, [appendLivePoint, interval.min]);
+
+  const closeUpstoxLive = useCallback(() => {
+    stopLiveAnimation();
+    upstoxUnsubsRef.current.forEach((unsub) => unsub());
+    upstoxUnsubsRef.current = [];
+    if (upstoxKeysRef.current.length) upstoxWS.releaseKeys(upstoxKeysRef.current);
+    upstoxKeysRef.current = [];
+    liveSpotRef.current = 0;
+    liveLtpByStrikeRef.current = new Map();
+    lastUpstoxTickRef.current = null;
+    liveStrikeRef.current = null;
+    pendingLiveRef.current = null;
+    if (liveFrameRef.current != null) {
+      window.cancelAnimationFrame(liveFrameRef.current);
+      liveFrameRef.current = null;
+    }
+  }, [stopLiveAnimation]);
+
+  const connectUpstoxLive = useCallback((context: LoadedContext) => {
+    closeUpstoxLive();
+    const keyMeta = new Map<string, { strike: number; side: "ce" | "pe" }>();
+    const ltpByStrike = new Map<number, LiveLegLtp>();
+    const keys = [context.spotKey];
+
+    for (const leg of context.legs) {
+      keys.push(leg.ceKey, leg.peKey);
+      keyMeta.set(leg.ceKey, { strike: leg.strike, side: "ce" });
+      keyMeta.set(leg.peKey, { strike: leg.strike, side: "pe" });
+      const ceTick = upstoxWS.get(leg.ceKey);
+      const peTick = upstoxWS.get(leg.peKey);
+      const lastCe = leg.ce.at(-1);
+      const lastPe = leg.pe.at(-1);
+      ltpByStrike.set(leg.strike, {
+        ce: ceTick?.ltp || lastCe?.close || 0,
+        pe: peTick?.ltp || lastPe?.close || 0,
+        ceIv: ceTick?.iv || leg.ceIv || 0,
+        peIv: peTick?.iv || leg.peIv || 0,
+        ceAt: ceTick?.ltp ? Date.now() : 0,
+        peAt: peTick?.ltp ? Date.now() : 0,
+      });
+    }
+
+    liveSpotRef.current = upstoxWS.get(context.spotKey)?.ltp || context.spotCandles.at(-1)?.close || 0;
+    liveLtpByStrikeRef.current = ltpByStrike;
+    upstoxKeysRef.current = keys;
+    upstoxWS.connect();
+    upstoxWS.requestKeys(keys);
+
+    const unsubs: Array<() => void> = [];
+    unsubs.push(upstoxWS.subscribe(context.spotKey, (tick: UpstoxTick) => {
+      if (!tick.ltp) return;
+      liveSpotRef.current = tick.ltp;
+      applyUpstoxLive();
+    }));
+
+    for (const [key, meta] of keyMeta.entries()) {
+      unsubs.push(upstoxWS.subscribe(key, (tick: UpstoxTick) => {
+        if (!tick.ltp) return;
+        const row = liveLtpByStrikeRef.current.get(meta.strike) || { ce: 0, pe: 0, ceIv: 0, peIv: 0, ceAt: 0, peAt: 0 };
+        if (meta.side === "ce") {
+          row.ce = tick.ltp;
+          row.ceAt = Date.now();
+          if (tick.iv) row.ceIv = tick.iv;
+        } else {
+          row.pe = tick.ltp;
+          row.peAt = Date.now();
+          if (tick.iv) row.peIv = tick.iv;
+        }
+        liveLtpByStrikeRef.current.set(meta.strike, row);
+        applyUpstoxLive();
+      }));
+    }
+
+    upstoxUnsubsRef.current = unsubs;
+    applyUpstoxLive();
+  }, [applyUpstoxLive, closeUpstoxLive]);
+
+  const closeNubraWs = useCallback(() => {
+    if (nubraReconnectRef.current) {
+      clearTimeout(nubraReconnectRef.current);
+      nubraReconnectRef.current = null;
+    }
+    if (nubraWsRef.current) {
+      nubraWsRef.current.onclose = null;
+      nubraWsRef.current.onmessage = null;
+      nubraWsRef.current.close();
+      nubraWsRef.current = null;
+    }
+  }, []);
+
+  const connectNubraWs = useCallback((expiry?: string) => {
+    closeNubraWs();
+    const context = loadedRef.current;
+    const savedNubra = getBrokerCredentials("nubra");
+    if (savedNubra?.values) syncBrokerRuntimeKeys("nubra", savedNubra.values);
+    const sessionToken = localStorage.getItem("nubra_session_token") || "";
+    if (!sessionToken) {
+      setNubraWsStatus("missing-token");
+      return;
+    }
+    if (!context || !expiry || !context.legs.length) {
+      setNubraWsStatus("idle");
+      return;
+    }
+
+    const exchange = BSE_SYMBOLS.has(normalizeSymbol(context.symbol)) ? "BSE" : "NSE";
+    const ws = new WebSocket(NUBRA_BRIDGE_URL);
+    nubraWsRef.current = ws;
+    setNubraWsStatus("connecting");
+
+    ws.onopen = () => {
+      setNubraWsStatus("live");
+      ws.send(JSON.stringify({
+        action: "subscribe",
+        session_token: sessionToken,
+        data_type: "option",
+        symbols: [`${normalizeSymbol(context.symbol)}:${toNubraExpiryValue(expiry)}`],
+        exchange,
+      }));
+    };
+
+    ws.onmessage = (event) => {
+      try {
+        const msg = JSON.parse(event.data as string);
+        if (msg.type === "error") {
+          setError(msg.message || "Nubra bridge error");
+          setNubraWsStatus("error");
+          return;
+        }
+        if (msg.type !== "option") return;
+        mergeOptionSnapshot(nubraSnapshotRef.current, msg.data || {});
+        const live = loadedRef.current ? buildLiveRollingPoint(loadedRef.current, nubraSnapshotRef.current, interval.min) : null;
+        if (live) {
+          const now = Date.now();
+          if (now - lastTickBadgePaintRef.current > 1000) {
+            lastTickBadgePaintRef.current = now;
+            setLastNubraTick(now);
+          }
+          if (live.rollingIv[0]) appendLiveIvPoint(live.rollingIv[0]);
+          const upstoxStale = !lastUpstoxTickRef.current || Date.now() - lastUpstoxTickRef.current > 5000;
+          if (upstoxStale) appendLivePoint(live);
+        }
+      } catch {
+        setNubraWsStatus("error");
+      }
+    };
+
+    ws.onclose = () => {
+      if (nubraWsRef.current !== ws) return;
+      nubraWsRef.current = null;
+      setNubraWsStatus("closed");
+      nubraReconnectRef.current = window.setTimeout(() => connectNubraWs(expiry), 3000);
+    };
+
+    ws.onerror = () => {
+      setNubraWsStatus("error");
+      ws.close();
+    };
+  }, [appendLiveIvPoint, closeNubraWs, interval.min]);
+
+  useEffect(() => () => {
+    closeNubraWs();
+    closeUpstoxLive();
+  }, [closeNubraWs, closeUpstoxLive]);
 
   const loadPreviousDay = useCallback(async () => {
     const context = loadedRef.current;
@@ -752,7 +1279,15 @@ export default function AutoRollingStraddle() {
       }
       seriesRef.current = {};
       loadedRef.current = null;
+      plottedDataRef.current = null;
+      nubraSnapshotRef.current = { ce: new Map(), pe: new Map(), currentPrice: 0 };
       loadedFromRef.current = new Set();
+      closeNubraWs();
+      closeUpstoxLive();
+      setNubraWsStatus("idle");
+      setLastNubraTick(null);
+      setLastUpstoxTick(null);
+      lastUpstoxTickRef.current = null;
 
       const spotKey = INDEX_KEYS[symbol] || symbols.find((item) =>
         normalizeSymbol(item.tradingSymbol || item.symbol) === normalizeSymbol(symbol)
@@ -833,7 +1368,7 @@ export default function AutoRollingStraddle() {
       addLine("ce", "right", 1).setData(data.ce);
       addLine("pe", "right", 1).setData(data.pe);
 
-      loadedRef.current = {
+      const context: LoadedContext = {
         symbol,
         expiry: selectedExpiry,
         spotKey,
@@ -843,7 +1378,11 @@ export default function AutoRollingStraddle() {
         ivData: nubraIv,
         pointCount: data.premium.length,
       };
+      loadedRef.current = context;
+      liveStrikeRef.current = data.strike.at(-1)?.value || null;
       updateSeriesData(data, rollingIv, ivSource, false);
+      connectUpstoxLive(context);
+      connectNubraWs(selectedExpiry);
       chart.timeScale().fitContent();
       requestAnimationFrame(updateDaySeparators);
       window.setTimeout(updateDaySeparators, 120);
@@ -852,7 +1391,7 @@ export default function AutoRollingStraddle() {
     } finally {
       setLoading(false);
     }
-  }, [chain, chainData?.spotPrice, interval, selectedExpiry, symbol, symbols, updateSeriesData, updateDaySeparators, visible]);
+  }, [chain, chainData?.spotPrice, interval, selectedExpiry, symbol, symbols, updateSeriesData, updateDaySeparators, visible, closeNubraWs, closeUpstoxLive, connectUpstoxLive, connectNubraWs]);
 
   return (
     <div className="-m-3 flex h-[calc(100vh-78px)] min-h-[720px] flex-col overflow-hidden bg-background text-foreground lg:-m-4">
@@ -924,6 +1463,26 @@ export default function AutoRollingStraddle() {
         </div>
 
         <div className="ml-auto flex items-center gap-2">
+          <Badge
+            variant="outline"
+            className={lastUpstoxTick ? "border-sky-400/30 bg-sky-400/10 text-sky-300" : "border-border bg-muted/30 text-muted-foreground"}
+          >
+            <span className={`mr-1.5 h-1.5 w-1.5 rounded-full ${lastUpstoxTick ? "animate-pulse bg-sky-300" : "bg-current opacity-60"}`} />
+            Upstox ticks{lastUpstoxTick ? ` · ${formatTickAge(lastUpstoxTick)} ago` : " idle"}
+          </Badge>
+          <Badge
+            variant="outline"
+            className={
+              nubraWsStatus === "live"
+                ? "border-emerald-400/30 bg-emerald-400/10 text-emerald-300"
+                : nubraWsStatus === "connecting" || nubraWsStatus === "closed"
+                  ? "border-amber-400/30 bg-amber-400/10 text-amber-300"
+                  : "border-border bg-muted/30 text-muted-foreground"
+            }
+          >
+            <span className={`mr-1.5 h-1.5 w-1.5 rounded-full ${nubraWsStatus === "live" ? "animate-pulse bg-emerald-300" : "bg-current opacity-60"}`} />
+            {NUBRA_WS_LABEL[nubraWsStatus]}{lastNubraTick ? ` · tick ${formatTickAge(lastNubraTick)} ago` : ""}
+          </Badge>
           <Badge variant="outline" className="border-border bg-muted/30 text-muted-foreground">
             True ATM {summary.atm ? summary.atm.toFixed(0) : "--"}
           </Badge>
@@ -994,7 +1553,7 @@ export default function AutoRollingStraddle() {
             <div className="rounded-md border border-border bg-card/90 px-4 py-3 text-center shadow-lg">
               <Activity className="mx-auto mb-2 h-5 w-5 text-primary" />
               <div className="text-sm font-semibold">Load auto rolling straddle</div>
-              <div className="mt-1 text-xs text-muted-foreground">For each candle, checks spot ATM ±5 strikes and rolls to the lowest CE+PE straddle.</div>
+              <div className="mt-1 text-xs text-muted-foreground">For each candle, rolls to the nearest ATM strike and plots its CE+PE straddle.</div>
             </div>
           </div>
         )}
@@ -1018,7 +1577,11 @@ export default function AutoRollingStraddle() {
           )
         ))}
         <span className="ml-auto">
-          {loadingPrevious ? "Loading previous session..." : summary.points ? `${summary.points} aligned bars` : "Waiting for load"}
+          {loadingPrevious
+            ? "Loading previous session..."
+            : summary.points
+              ? `${summary.points} aligned bars · live points update once per minute from Nubra`
+              : "Waiting for load"}
         </span>
       </div>
     </div>

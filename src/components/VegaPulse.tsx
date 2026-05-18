@@ -1,5 +1,5 @@
-import { memo, useEffect, useMemo, useRef, useState } from "react";
-import { createChart, BaselineSeries, ColorType, LineSeries, type IChartApi, type ISeriesApi, type Time } from "lightweight-charts";
+import { memo, useEffect, useMemo, useRef, useState, type MutableRefObject } from "react";
+import { createChart, BaselineSeries, ColorType, LineSeries, LineStyle, type IChartApi, type ISeriesApi, type Time } from "lightweight-charts";
 import { Activity, Loader2, RefreshCw, LayoutGrid, Columns3, Square, PanelTop } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -89,6 +89,14 @@ function toNubraExpiryInt(expiry: string) {
   return Number(`${yyyy}${mm}${dd}`);
 }
 
+function toNubraExpiryValue(expiry: string) {
+  const d = new Date(`${expiry}T00:00:00+05:30`);
+  const yyyy = d.toLocaleString("en-IN", { year: "numeric", timeZone: "Asia/Kolkata" });
+  const mm = d.toLocaleString("en-IN", { month: "2-digit", timeZone: "Asia/Kolkata" });
+  const dd = d.toLocaleString("en-IN", { day: "2-digit", timeZone: "Asia/Kolkata" });
+  return `${yyyy}${mm}${dd}`;
+}
+
 function previousTradingDay(dateStr: string) {
   const d = new Date(`${dateStr}T00:00:00.000Z`);
   d.setUTCDate(d.getUTCDate() - 1);
@@ -139,6 +147,20 @@ function formatGreek(value: number) {
   if (abs >= 100000) return `${sign}${(abs / 100000).toFixed(2)}L`;
   if (abs >= 1000) return `${sign}${(abs / 1000).toFixed(1)}K`;
   return `${sign}${abs.toFixed(4)}`;
+}
+
+function normalizeSpotValue(raw: number) {
+  let value = Number(raw);
+  if (!Number.isFinite(value) || value <= 0) return NaN;
+  while (value > 100000) value /= 100;
+  return value;
+}
+
+function normalizeOiValue(raw: number) {
+  let value = Number(raw);
+  if (!Number.isFinite(value) || value < 0) return NaN;
+  while (value > 500000000) value /= 100;
+  return value;
 }
 
 function nearestAtmIndex(chain: OptionData[], spotPrice: number) {
@@ -399,7 +421,7 @@ function parseSpotRows(json: any, symbol: string): SpotPoint[] {
       if (!Array.isArray(arr)) continue;
       for (const point of arr) {
         const ts = pointTs(point);
-        const value = Number(point?.v ?? point?.value);
+        const value = normalizeSpotValue(Number(point?.v ?? point?.value));
         if (ts > 0 && Number.isFinite(value)) rows.push({ ts, value });
       }
     }
@@ -536,6 +558,16 @@ function GreekPulseChart({ points, spotPoints, height, mode }: GreekChartProps) 
       title: `${cfg.label} Diff`,
     }, 1);
     const diffAvg = chart.addSeries(LineSeries, { color: "#f59e0b", lineWidth: 1, priceLineVisible: false, lastValueVisible: true, title: `${cfg.label} Diff Avg` }, 1);
+    const zeroLine = {
+      price: 0,
+      color: "rgba(255,255,255,0.82)",
+      lineWidth: 1 as const,
+      lineStyle: LineStyle.Solid,
+      axisLabelVisible: true,
+      title: "0",
+    };
+    call.createPriceLine(zeroLine);
+    diff.createPriceLine(zeroLine);
     const spot = chart.addSeries(LineSeries, { color: "#1d9bf0", lineWidth: 1, crosshairMarkerRadius: 3, priceLineVisible: false, lastValueVisible: true, title: "Spot" }, 2);
     const spotAvg = chart.addSeries(LineSeries, { color: "#f59e0b", lineWidth: 1, priceLineVisible: false, lastValueVisible: true, title: "Spot Avg" }, 2);
     chartRef.current = chart;
@@ -834,78 +866,179 @@ function OiChart({ points, height }: { points: OiPoint[]; height: number }) {
 
 const BRIDGE_URL = "ws://localhost:8765";
 const GREEKS_ALL: GreekMode[] = ["vega", "theta", "gamma"];
+const MAX_LIVE_PULSE_JUMP: Record<GreekMode, number> = {
+  vega: 80,
+  theta: 200,
+  gamma: 20,
+};
+
+type WsGreekBase = {
+  callBase: number;
+  putBase: number;
+  callOffset: number;
+  putOffset: number;
+};
+
+type WsOiBase = {
+  callBase: number;
+  putBase: number;
+  callOffset: number;
+  putOffset: number;
+  openCallOi: number;
+  openPutOi: number;
+};
+
+type WsOptionSnapshot = {
+  ce: Map<number, any>;
+  pe: Map<number, any>;
+};
 
 function getNubraSessionToken(): string {
   return localStorage.getItem("nubra_session_token") || "";
 }
 
-// Sums a greek field across CE/PE basket strikes from one WS option message
+function wsStrike(item: any) {
+  const strike = Number(item?.strike_price ?? item?.strikePrice ?? item?.sp ?? 0);
+  return Number.isFinite(strike) && strike > 0 ? Math.round(strike) : 0;
+}
+
+function mergeWsOptionSnapshot(snapshot: WsOptionSnapshot, ceItems: any[], peItems: any[]) {
+  for (const item of ceItems) {
+    const strike = wsStrike(item);
+    if (strike > 0) snapshot.ce.set(strike, { ...(snapshot.ce.get(strike) || {}), ...item, strike_price: strike });
+  }
+  for (const item of peItems) {
+    const strike = wsStrike(item);
+    if (strike > 0) snapshot.pe.set(strike, { ...(snapshot.pe.get(strike) || {}), ...item, strike_price: strike });
+  }
+}
+
+function hasWsBasket(snapshot: WsOptionSnapshot, callStrikes: Set<number>, putStrikes: Set<number>) {
+  for (const strike of callStrikes) {
+    if (!snapshot.ce.has(Math.round(strike))) return false;
+  }
+  for (const strike of putStrikes) {
+    if (!snapshot.pe.has(Math.round(strike))) return false;
+  }
+  return callStrikes.size > 0 || putStrikes.size > 0;
+}
+
+// Sums a greek field across the selected CE/PE basket strikes from the latest WS snapshot.
 function sumWsGreeks(
-  ceItems: any[],
-  peItems: any[],
-  basketStrikes: Set<number>,
+  snapshot: WsOptionSnapshot,
+  callStrikes: Set<number>,
+  putStrikes: Set<number>,
   field: GreekMode,
 ): { callVal: number; putVal: number } {
   let callVal = 0;
   let putVal = 0;
-  for (const item of ceItems) {
-    const sp = Number(item?.strike_price ?? 0);
-    if (!basketStrikes.has(sp)) continue;
+  for (const strike of callStrikes) {
+    const item = snapshot.ce.get(Math.round(strike));
+    if (!item) continue;
     const v = Number(item?.[field]);
     if (Number.isFinite(v)) callVal += v;
   }
-  for (const item of peItems) {
-    const sp = Number(item?.strike_price ?? 0);
-    if (!basketStrikes.has(sp)) continue;
+  for (const strike of putStrikes) {
+    const item = snapshot.pe.get(Math.round(strike));
+    if (!item) continue;
     const v = Number(item?.[field]);
     if (Number.isFinite(v)) putVal += v;
   }
   return { callVal, putVal };
 }
 
-function appendWsPoint(prev: PulsePoint[], ts: number, callVal: number, putVal: number): PulsePoint[] {
+function appendWsPoint(
+  prev: PulsePoint[],
+  ts: number,
+  callVal: number,
+  putVal: number,
+  mode: GreekMode,
+  baseRef: MutableRefObject<Record<GreekMode, WsGreekBase | null>>,
+): PulsePoint[] {
+  const last = prev[prev.length - 1];
   const opening = prev[0] ?? { callVal, putVal };
   const totalVal = callVal + putVal;
-  const openingTotal = opening.callVal + opening.putVal;
+  const callPulse = callVal - opening.callVal;
+  const putPulse = putVal - opening.putVal;
+  const totalPulse = callPulse + putPulse;
+
+  if (last) {
+    const maxJump = MAX_LIVE_PULSE_JUMP[mode];
+    const callJump = Math.abs(callPulse - last.callPulse);
+    const putJump = Math.abs(putPulse - last.putPulse);
+    if (callJump > maxJump || putJump > maxJump) return prev;
+  }
+
   const next: PulsePoint = {
     ts,
     callVal,
     putVal,
     totalVal,
-    callPulse: callVal - opening.callVal,
-    putPulse: putVal - opening.putVal,
-    totalPulse: totalVal - openingTotal,
+    callPulse,
+    putPulse,
+    totalPulse,
   };
-  // Replace last point if same minute, else append
-  const last = prev[prev.length - 1];
   if (last && Math.floor(last.ts / 60000) === Math.floor(ts / 60000)) {
     return [...prev.slice(0, -1), next];
   }
   return [...prev, next];
 }
 
-function sumWsOi(ceItems: any[], peItems: any[], basketStrikes: Set<number>): { callOi: number; putOi: number } {
+function sumWsOi(snapshot: WsOptionSnapshot, callStrikes: Set<number>, putStrikes: Set<number>): { callOi: number; putOi: number } {
   let callOi = 0, putOi = 0;
-  for (const item of ceItems) {
-    const sp = Number(item?.strike_price ?? 0);
-    if (!basketStrikes.has(sp)) continue;
-    const v = Number(item?.open_interest ?? item?.oi ?? 0);
+  for (const strike of callStrikes) {
+    const item = snapshot.ce.get(Math.round(strike));
+    if (!item) continue;
+    const v = normalizeOiValue(Number(item?.open_interest ?? item?.oi ?? 0));
     if (Number.isFinite(v)) callOi += v;
   }
-  for (const item of peItems) {
-    const sp = Number(item?.strike_price ?? 0);
-    if (!basketStrikes.has(sp)) continue;
-    const v = Number(item?.open_interest ?? item?.oi ?? 0);
+  for (const strike of putStrikes) {
+    const item = snapshot.pe.get(Math.round(strike));
+    if (!item) continue;
+    const v = normalizeOiValue(Number(item?.open_interest ?? item?.oi ?? 0));
     if (Number.isFinite(v)) putOi += v;
   }
   return { callOi, putOi };
 }
 
-function appendWsOiPoint(prev: OiPoint[], ts: number, callOi: number, putOi: number): OiPoint[] {
+function appendWsOiPoint(
+  prev: OiPoint[],
+  ts: number,
+  callOi: number,
+  putOi: number,
+  baseRef: MutableRefObject<WsOiBase | null>,
+): OiPoint[] {
   if (callOi === 0 && putOi === 0) return prev;
-  const opening = prev[0] ?? { callOi, putOi };
-  const next: OiPoint = { ts, callOi, putOi, openCallOi: opening.callOi, openPutOi: opening.putOi };
   const last = prev[prev.length - 1];
+  let base = baseRef.current;
+  if (!base) {
+    base = {
+      callBase: callOi,
+      putBase: putOi,
+      callOffset: last?.callOi ?? callOi,
+      putOffset: last?.putOi ?? putOi,
+      openCallOi: last?.openCallOi ?? callOi,
+      openPutOi: last?.openPutOi ?? putOi,
+    };
+    baseRef.current = base;
+  }
+
+  const nextCallOi = base.callOffset + (callOi - base.callBase);
+  const nextPutOi = base.putOffset + (putOi - base.putBase);
+  if (last) {
+    const callJump = Math.abs(nextCallOi - last.callOi);
+    const putJump = Math.abs(nextPutOi - last.putOi);
+    const maxJump = Math.max(5000000, Math.max(last.callOi, last.putOi, nextCallOi, nextPutOi) * 0.35);
+    if (callJump > maxJump || putJump > maxJump) return prev;
+  }
+
+  const next: OiPoint = {
+    ts,
+    callOi: nextCallOi,
+    putOi: nextPutOi,
+    openCallOi: base.openCallOi,
+    openPutOi: base.openPutOi,
+  };
   if (last && Math.floor(last.ts / 60000) === Math.floor(ts / 60000)) return [...prev.slice(0, -1), next];
   return [...prev, next];
 }
@@ -922,6 +1055,12 @@ function VegaPulseComponent({ symbol = "NIFTY", height = 640, compact = false }:
   const [wsConnected, setWsConnected] = useState(false);
   const wsRef = useRef<WebSocket | null>(null);
   const wsReconnTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const wsGreekBaseRef = useRef<Record<GreekMode, WsGreekBase | null>>({ vega: null, theta: null, gamma: null });
+  const wsOiBaseRef = useRef<WsOiBase | null>(null);
+  const wsOptionSnapshotRef = useRef<WsOptionSnapshot>({ ce: new Map(), pe: new Map() });
+  const activeLoadKeyRef = useRef("");
+  const pendingRestFlowRef = useRef("");
+  const loadedRestFlowRef = useRef("");
 
   const { data: indicesResult } = useLiveIndices();
   const { data: expiryData, isLoading: expiriesLoading } = useExpiryList(symbol);
@@ -939,21 +1078,26 @@ function VegaPulseComponent({ symbol = "NIFTY", height = 640, compact = false }:
 
   const allLegs = useMemo(() => [...basket.callLegs, ...basket.putLegs], [basket.callLegs, basket.putLegs]);
 
-  // Pre-compute the set of basket strike prices for fast WS lookup
-  const basketStrikes = useMemo(() => new Set(allLegs.map((l) => l.strike)), [allLegs]);
+  const callBasketStrikes = useMemo(() => new Set(basket.callLegs.map((l) => l.strike)), [basket.callLegs]);
+  const putBasketStrikes = useMemo(() => new Set(basket.putLegs.map((l) => l.strike)), [basket.putLegs]);
 
   const openingCallGreek = (mode: GreekMode) => {
+    const first = allData[mode][0];
+    if (first && Number.isFinite(first.callVal)) return first.callVal;
     if (mode === "vega") return basket.callLegs.reduce((sum, leg) => sum + leg.openingVega, 0);
     if (mode === "theta") return basket.callLegs.reduce((sum, leg) => sum + leg.openingTheta, 0);
     return basket.callLegs.reduce((sum, leg) => sum + leg.openingGamma, 0);
   };
   const openingPutGreek = (mode: GreekMode) => {
+    const first = allData[mode][0];
+    if (first && Number.isFinite(first.putVal)) return first.putVal;
     if (mode === "vega") return basket.putLegs.reduce((sum, leg) => sum + leg.openingVega, 0);
     if (mode === "theta") return basket.putLegs.reduce((sum, leg) => sum + leg.openingTheta, 0);
     return basket.putLegs.reduce((sum, leg) => sum + leg.openingGamma, 0);
   };
 
   const isGridLayout = layoutMode !== "single";
+  const basketKey = useMemo(() => allLegs.map((leg) => `${leg.side}${leg.strike}`).join("|"), [allLegs]);
 
   // ── REST: initial historical load ────────────────────────────────────────
 
@@ -1012,36 +1156,50 @@ function VegaPulseComponent({ symbol = "NIFTY", height = 640, compact = false }:
       const openCallOi = sorted[0]?.callVal ?? 0;
       const openPutOi  = sorted[0]?.putVal  ?? 0;
       const oiPts: OiPoint[] = sorted.map((r) => ({
-        ts: r.ts, callOi: r.callVal, putOi: r.putVal, openCallOi, openPutOi,
-      }));
+        ts: r.ts,
+        callOi: normalizeOiValue(r.callVal),
+        putOi: normalizeOiValue(r.putVal),
+        openCallOi: normalizeOiValue(openCallOi),
+        openPutOi: normalizeOiValue(openPutOi),
+      })).filter((p) => Number.isFinite(p.callOi) && Number.isFinite(p.putOi));
       setAllData((prev) => ({ ...prev, oi: oiPts }));
     } catch { /* silent */ }
   };
 
-  const doInitialLoad = async (expiry: string, legs: SelectedLeg[], grid: boolean, singleMode: GreekMode) => {
+  const doInitialLoad = async (expiry: string, legs: SelectedLeg[]) => {
     if (!expiry || legs.length === 0) return;
     await doFetchSpot();
     await doFetchOi(expiry, legs);
-    if (grid) {
-      await Promise.all(GREEKS_ALL.map((m) => doFetchGreek(m, expiry, legs)));
-    } else {
-      await doFetchGreek(singleMode, expiry, legs);
-    }
+    await Promise.all(GREEKS_ALL.map((m) => doFetchGreek(m, expiry, legs)));
   };
 
   // ── WebSocket: live updates from Nubra bridge ────────────────────────────
 
-  const connectWs = (expiry: string, strikes: Set<number>) => {
+  const resetLiveBases = () => {
+    wsGreekBaseRef.current = { vega: null, theta: null, gamma: null };
+    wsOiBaseRef.current = null;
+    wsOptionSnapshotRef.current = { ce: new Map(), pe: new Map() };
+  };
+
+  const closeWs = () => {
     if (wsRef.current) {
       wsRef.current.onclose = null;
       wsRef.current.onmessage = null;
       wsRef.current.close();
       wsRef.current = null;
     }
-    if (wsReconnTimer.current) { clearTimeout(wsReconnTimer.current); wsReconnTimer.current = null; }
+    if (wsReconnTimer.current) {
+      clearTimeout(wsReconnTimer.current);
+      wsReconnTimer.current = null;
+    }
+    setWsConnected(false);
+  };
+
+  const connectWs = (expiry: string, callStrikes: Set<number>, putStrikes: Set<number>) => {
+    closeWs();
 
     const sessionToken = getNubraSessionToken();
-    if (!sessionToken || !expiry || strikes.size === 0) return;
+    if (!sessionToken || !expiry || (callStrikes.size === 0 && putStrikes.size === 0)) return;
 
     const exchange = BSE_SYMBOLS.has(normalizeSymbol(symbol)) ? "BSE" : "NSE";
     const ws = new WebSocket(BRIDGE_URL);
@@ -1053,7 +1211,7 @@ function VegaPulseComponent({ symbol = "NIFTY", height = 640, compact = false }:
         action: "subscribe",
         session_token: sessionToken,
         data_type: "option",
-        symbols: [`${normalizeSymbol(symbol)}:${expiry}`],
+        symbols: [`${normalizeSymbol(symbol)}:${toNubraExpiryValue(expiry)}`],
         exchange,
       }));
     };
@@ -1064,27 +1222,31 @@ function VegaPulseComponent({ symbol = "NIFTY", height = 640, compact = false }:
         if (msg.type !== "option") return;
         const { ce = [], pe = [], current_price } = msg.data as { ce: any[]; pe: any[]; current_price?: number };
         const ts = Date.now();
+        mergeWsOptionSnapshot(wsOptionSnapshotRef.current, ce, pe);
 
-        // Append live spot point
-        if (Number.isFinite(current_price) && (current_price ?? 0) > 0) {
+        const spotValue = normalizeSpotValue(Number(current_price));
+        if (Number.isFinite(spotValue)) {
           setAllData((prev) => {
             const last = prev.spot[prev.spot.length - 1];
             if (last && Math.floor(last.ts / 60000) === Math.floor(ts / 60000)) {
-              return { ...prev, spot: [...prev.spot.slice(0, -1), { ts, value: current_price! }] };
+              return { ...prev, spot: [...prev.spot.slice(0, -1), { ts, value: spotValue }] };
             }
-            return { ...prev, spot: [...prev.spot, { ts, value: current_price! }] };
+            return { ...prev, spot: [...prev.spot, { ts, value: spotValue }] };
           });
         }
 
         // Append live greek + OI points
         setAllData((prev) => {
           const next = { ...prev };
+          if (!hasWsBasket(wsOptionSnapshotRef.current, callStrikes, putStrikes)) return next;
           for (const m of GREEKS_ALL) {
-            const { callVal, putVal } = sumWsGreeks(ce, pe, strikes, m);
-            if (callVal !== 0 || putVal !== 0) next[m] = appendWsPoint(prev[m], ts, callVal, putVal);
+            const { callVal, putVal } = sumWsGreeks(wsOptionSnapshotRef.current, callStrikes, putStrikes, m);
+            if (prev[m].length > 0 && (callVal !== 0 || putVal !== 0)) {
+              next[m] = appendWsPoint(prev[m], ts, callVal, putVal, m, wsGreekBaseRef);
+            }
           }
-          const { callOi, putOi } = sumWsOi(ce, pe, strikes);
-          next.oi = appendWsOiPoint(prev.oi, ts, callOi, putOi);
+          const { callOi, putOi } = sumWsOi(wsOptionSnapshotRef.current, callStrikes, putStrikes);
+          if (prev.oi.length > 0) next.oi = appendWsOiPoint(prev.oi, ts, callOi, putOi, wsOiBaseRef);
           return next;
         });
       } catch { /* ignore parse errors */ }
@@ -1094,57 +1256,84 @@ function VegaPulseComponent({ symbol = "NIFTY", height = 640, compact = false }:
       setWsConnected(false);
       wsRef.current = null;
       // Reconnect after 3s
-      wsReconnTimer.current = setTimeout(() => connectWs(expiry, strikes), 3000);
+      wsReconnTimer.current = setTimeout(() => connectWs(expiry, callStrikes, putStrikes), 3000);
     };
 
     ws.onerror = () => { ws.close(); };
+  };
+
+  const loadRestThenConnectWs = async (
+    flowKey: string,
+    loadKey: string,
+    expiry: string,
+    legs: SelectedLeg[],
+    callStrikes: Set<number>,
+    putStrikes: Set<number>,
+    shouldConnect: () => boolean = () => true,
+  ) => {
+    if (!expiry || legs.length === 0) return;
+    if (pendingRestFlowRef.current === flowKey) return;
+    pendingRestFlowRef.current = flowKey;
+    activeLoadKeyRef.current = loadKey;
+    closeWs();
+    resetLiveBases();
+    try {
+      await doInitialLoad(expiry, legs);
+      if (!shouldConnect() || activeLoadKeyRef.current !== loadKey) return;
+      loadedRestFlowRef.current = flowKey;
+      resetLiveBases();
+      connectWs(expiry, callStrikes, putStrikes);
+    } finally {
+      if (pendingRestFlowRef.current === flowKey) pendingRestFlowRef.current = "";
+    }
   };
 
   // ── Handlers ─────────────────────────────────────────────────────────────
 
   const handleGreekSwitch = (mode: GreekMode) => {
     setGreekMode(mode);
-    if (!loadedGreeks.has(mode) && allData[mode].length === 0) {
-      void doFetchGreek(mode, selectedExpiry!, allLegs);
-    }
   };
 
   const handleLayoutSwitch = (mode: LayoutMode) => {
     setLayoutMode(mode);
-    if (mode !== "single") {
-      GREEKS_ALL.forEach((m) => {
-        if (!loadedGreeks.has(m) && allData[m].length === 0) void doFetchGreek(m, selectedExpiry!, allLegs);
-      });
-    }
   };
 
   const handleRefresh = () => {
+    const flowKey = `${symbol}:${selectedExpiry || ""}`;
+    const loadKey = `${symbol}:${selectedExpiry || ""}:${basketKey}:${isGridLayout ? "grid" : greekMode}`;
     // Only reset REST data — WS keeps running and will append fresh ticks on top
+    loadedRestFlowRef.current = "";
+    pendingRestFlowRef.current = "";
     setLoadedGreeks(new Set());
     setAllData({ vega: [], theta: [], gamma: [], spot: [], oi: [] });
+    resetLiveBases();
     setErrors({});
-    void doInitialLoad(selectedExpiry || "", allLegs, isGridLayout, greekMode);
+    void loadRestThenConnectWs(flowKey, loadKey, selectedExpiry || "", allLegs, callBasketStrikes, putBasketStrikes);
   };
 
   // ── Mount / expiry / basket change: REST load + WS connect ───────────────
 
   useEffect(() => {
+    const flowKey = `${symbol}:${selectedExpiry || ""}`;
+    const loadKey = `${symbol}:${selectedExpiry || ""}:${basketKey}:${isGridLayout ? "grid" : greekMode}`;
+    if (!selectedExpiry || allLegs.length === 0) return;
+    if (loadedRestFlowRef.current === flowKey || pendingRestFlowRef.current === flowKey) return;
+
     setAllData({ vega: [], theta: [], gamma: [], spot: [], oi: [] });
     setLoadedGreeks(new Set());
+    resetLiveBases();
     setErrors({});
-    if (!selectedExpiry || allLegs.length === 0) return;
 
-    void doInitialLoad(selectedExpiry, allLegs, isGridLayout, greekMode);
-    connectWs(selectedExpiry, basketStrikes);
+    let cancelled = false;
+    void loadRestThenConnectWs(flowKey, loadKey, selectedExpiry, allLegs, callBasketStrikes, putBasketStrikes, () => !cancelled);
 
     return () => {
-      if (wsRef.current) { wsRef.current.onclose = null; wsRef.current.close(); wsRef.current = null; }
-      if (wsReconnTimer.current) { clearTimeout(wsReconnTimer.current); wsReconnTimer.current = null; }
-      setWsConnected(false);
+      cancelled = true;
+      closeWs();
     };
-  }, [symbol, selectedExpiry, allLegs.map((leg) => `${leg.side}${leg.strike}`).join("|")]);
+  }, [symbol, selectedExpiry, allLegs.length > 0]);
 
-  const anyLoading = expiriesLoading || chainLoading || loadingGreeks.size > 0;
+  const baseLoading = expiriesLoading || chainLoading;
   const chartHeight = compact ? 220 : height;
   // In grid modes give each chart a reduced height so all fit on screen
   const gridChartH = compact ? 180 : Math.round(chartHeight * 0.62);
@@ -1152,6 +1341,8 @@ function VegaPulseComponent({ symbol = "NIFTY", height = 640, compact = false }:
   const activePoints = allData[greekMode];
   const latest = activePoints[activePoints.length - 1];
   const isEmpty = !selectedExpiry || allLegs.length === 0;
+  const isGreekLoading = (mode: GreekMode) => allData[mode].length === 0 && (baseLoading || loadingGreeks.has(mode));
+  const anyLoading = loadingGreeks.size > 0 || (activePoints.length === 0 && baseLoading);
 
   return (
     <Card className="min-h-[calc(100vh-6rem)]">
@@ -1284,7 +1475,7 @@ function VegaPulseComponent({ symbol = "NIFTY", height = 640, compact = false }:
 
         {/* Chart area */}
         {layoutMode === "single" && (
-          expiriesLoading || chainLoading || loadingGreeks.has(greekMode) ? (
+          isGreekLoading(greekMode) ? (
             <div className="flex items-center justify-center gap-2 text-sm text-muted-foreground" style={{ height: chartHeight }}>
               <Loader2 className="h-4 w-4 animate-spin" />Loading {cfg.label} Pulse…
             </div>
@@ -1308,7 +1499,7 @@ function VegaPulseComponent({ symbol = "NIFTY", height = 640, compact = false }:
                 points={allData[m]}
                 spotPoints={allData.spot}
                 height={gridChartH}
-                loading={expiriesLoading || chainLoading || loadingGreeks.has(m)}
+                loading={isGreekLoading(m)}
                 error={errors[m] || ""}
                 isEmpty={isEmpty}
               />
@@ -1326,7 +1517,7 @@ function VegaPulseComponent({ symbol = "NIFTY", height = 640, compact = false }:
                   points={allData[m]}
                   spotPoints={allData.spot}
                   height={gridChartH}
-                  loading={expiriesLoading || chainLoading || loadingGreeks.has(m)}
+                  loading={isGreekLoading(m)}
                   error={errors[m] || ""}
                   isEmpty={isEmpty}
                 />
@@ -1337,7 +1528,7 @@ function VegaPulseComponent({ symbol = "NIFTY", height = 640, compact = false }:
               points={allData.gamma}
               spotPoints={allData.spot}
               height={gridChartH}
-              loading={expiriesLoading || chainLoading || loadingGreeks.has("gamma")}
+              loading={isGreekLoading("gamma")}
               error={errors.gamma || ""}
               isEmpty={isEmpty}
             />
@@ -1352,7 +1543,7 @@ function VegaPulseComponent({ symbol = "NIFTY", height = 640, compact = false }:
               points={allData.vega}
               spotPoints={allData.spot}
               height={gridChartH}
-              loading={expiriesLoading || chainLoading || loadingGreeks.has("vega")}
+              loading={isGreekLoading("vega")}
               error={errors.vega || ""}
               isEmpty={isEmpty}
             />
@@ -1365,7 +1556,7 @@ function VegaPulseComponent({ symbol = "NIFTY", height = 640, compact = false }:
                   points={allData[m]}
                   spotPoints={allData.spot}
                   height={gridChartH}
-                  loading={expiriesLoading || chainLoading || loadingGreeks.has(m)}
+                  loading={isGreekLoading(m)}
                   error={errors[m] || ""}
                   isEmpty={isEmpty}
                 />

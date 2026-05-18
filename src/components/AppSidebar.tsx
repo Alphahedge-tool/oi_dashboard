@@ -79,29 +79,29 @@ export function AppSidebar() {
     <Sidebar collapsible="icon">
       <SidebarHeader className={cn("border-b border-sidebar-border/80 px-4 py-4", collapsed && "items-center border-white/10 px-0 py-3")}>
         <div className={cn("flex items-center gap-3", collapsed && "justify-center gap-0")}>
-          <div className={cn("group relative flex h-9 w-9 items-center justify-center overflow-hidden rounded-lg border border-primary/25 bg-[#071018] shadow-glow-sm", collapsed && "h-10 w-10 rounded-xl border-primary/30")}>
-            <div className="absolute inset-0 bg-[radial-gradient(circle_at_50%_18%,hsl(var(--primary)/0.28),transparent_58%),linear-gradient(145deg,hsl(var(--primary)/0.16),transparent_76%)] opacity-95 transition-opacity duration-500" />
-            
-            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" className="relative z-10" aria-hidden="true">
-              <path d="M12 3V20" stroke="hsl(var(--primary))" strokeWidth="2.25" strokeLinecap="round" />
-              <path d="M6.5 7.5L12 3L17.5 7.5" stroke="hsl(var(--primary))" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round" />
-              <path d="M7.25 6.75V10.5C7.25 12.25 8.65 13.6 10.4 13.6H12" stroke="hsl(var(--primary))" strokeWidth="1.65" strokeLinecap="round" />
-              <path d="M16.75 6.75V10.5C16.75 12.25 15.35 13.6 13.6 13.6H12" stroke="hsl(var(--primary))" strokeWidth="1.65" strokeLinecap="round" />
-              <path d="M8.25 18.25H15.75" stroke="hsl(var(--primary))" strokeWidth="1.8" strokeLinecap="round" />
-              <circle cx="12" cy="12" r="2.15" fill="hsl(var(--primary))" opacity="0.9" />
+          <div className={cn("group relative flex h-9 w-9 items-center justify-center overflow-hidden rounded-lg border border-primary/30 bg-[#071018] shadow-glow-sm", collapsed && "h-10 w-10 rounded-xl")}>
+            <div className="absolute inset-0 bg-[radial-gradient(circle_at_30%_20%,hsl(var(--primary)/0.32),transparent_38%),linear-gradient(145deg,#071018,#101827_62%,#0b2630)] opacity-95 transition-opacity duration-500" />
+            <div className="absolute inset-[3px] rounded-md border border-white/8" />
+
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" className="relative z-10" aria-hidden="true">
+              <path d="M4 17.5H20" stroke="hsl(var(--primary))" strokeWidth="1.35" strokeLinecap="round" opacity="0.35" />
+              <path d="M5 15L8.4 11.6L11.1 14.2L16.2 8.4L19 10.7" stroke="hsl(var(--primary))" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+              <circle cx="8.4" cy="11.6" r="1.35" fill="hsl(var(--primary))" />
+              <circle cx="16.2" cy="8.4" r="1.35" fill="hsl(var(--primary))" />
+              <path d="M6.2 5.8H8.4M15.6 18.2H17.8M12 4.5V7M12 17V19.5" stroke="white" strokeWidth="1.1" strokeLinecap="round" opacity="0.42" />
             </svg>
           </div>
           {!collapsed && (
             <div className="flex flex-col">
-              <h1 className="text-[15px] font-bold text-foreground leading-none">Trishakti</h1>
+              <h1 className="text-[15px] font-bold text-foreground leading-none">Advance Algo</h1>
               <p className="text-[11px] text-muted-foreground/75 mt-1 tracking-[0.14em] font-semibold uppercase">Options Terminal</p>
             </div>
           )}
         </div>
         {collapsed && (
           <div className="mt-1 text-center leading-none">
-            <p className="text-[9px] font-bold uppercase tracking-[0.2em] text-primary">TRI</p>
-            <p className="mt-1 text-[6px] font-semibold uppercase tracking-[0.1em] text-white/38">Shakti</p>
+            <p className="text-[9px] font-bold uppercase tracking-[0.2em] text-primary">AA</p>
+            <p className="mt-1 text-[6px] font-semibold uppercase tracking-[0.1em] text-white/38">Algo</p>
           </div>
         )}
       </SidebarHeader>
